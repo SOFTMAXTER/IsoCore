@@ -53,7 +53,7 @@ Para un despliegue adecuado y detección automática de componentes (como herram
 ### Proyecto MRP (Multi OEM/Retail Project)
 IsoCore incluye soporte nativo y automatizado para inyectar este poderoso conjunto de herramientas. Es importante destacar que el paquete MRP es un proyecto externo e independiente. Todo el crédito por el desarrollo, el mantenimiento y la evolución continua de los scripts integrados en MRP corresponde enteramente a su creador y a la comunidad que lo respalda.
 
-⚠️ **Aviso de Uso y Alcance Educativo:** El paquete MRP proporcionado por defecto en este proyecto está diseñado y configurado para utilizarse **únicamente para la inyección de logotipos e información de soporte OEM** de los fabricantes de hardware. Su inclusión tiene fines estrictamente **educativos** e ilustrativos sobre cómo funciona el despliegue desatendido en entornos corporativos. IsoCore no promueve ni asume responsabilidad por la modificación manual de dicho paquete para alterar mecanismos de licenciamiento.
+⚠️ **Aviso de Uso y Alcance Educativo:** El paquete MRP proporcionado mediante este enlace: https://acortar.link/dFE5TE está diseñado y configurado para utilizarse **únicamente para la inyección de logotipos e información de soporte OEM** de los fabricantes de hardware. Su inclusión tiene fines estrictamente **educativos** e ilustrativos sobre cómo funciona el despliegue desatendido en entornos corporativos. IsoCore no promueve ni asume responsabilidad por la modificación manual de dicho paquete para alterar mecanismos de licenciamiento.
 
 * 📥 **Obtén las últimas actualizaciones de MRP y da soporte a su creador original visitando el foro oficial en:** [My Digital Life (MDL) Forums](https://forums.mydigitallife.net/) *(Requiere registro en la comunidad).*
 
