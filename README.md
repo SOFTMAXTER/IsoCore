@@ -55,7 +55,7 @@ IsoCore incluye soporte nativo y automatizado para inyectar este poderoso conjun
 
 ⚠️ **Aviso de Uso y Alcance Educativo:** El paquete MRP proporcionado mediante este enlace: https://acortar.link/dFE5TE está diseñado y configurado para utilizarse **únicamente para la inyección de logotipos e información de soporte OEM** de los fabricantes de hardware. Su inclusión tiene fines estrictamente **educativos** e ilustrativos sobre cómo funciona el despliegue desatendido en entornos corporativos. IsoCore no promueve ni asume responsabilidad por la modificación manual de dicho paquete para alterar mecanismos de licenciamiento.
 
-* 📥 **Obtén las últimas actualizaciones de MRP y da soporte a su creador original visitando el foro oficial en:** [My Digital Life (MDL) Forums](https://forums.mydigitallife.net/) *(Requiere registro en la comunidad).*
+* 📥 **Obtén las últimas actualizaciones de MRP y da soporte a su creador original visitando el foro oficial en:** [My Digital Life (MDL) Forums](https://forums.mydigitallife.net/threads/multi-oem-retail-project-mrp-mk3.71555/) *(Requiere registro en la comunidad).*
 
 ## Notas de Seguridad y Mejores Prácticas
 * **Falsos Positivos (Antivirus):** Si utilizas la inyección del paquete MRP, es **absolutamente crítico** desactivar temporalmente la protección en tiempo real de Windows Defender o de tu suite de seguridad de terceros. Incluso las configuraciones básicas de inyección OEM en scripts desatendidos suelen ser clasificadas sistemáticamente como falsos positivos (heurística). Si el antivirus interviene durante la extracción en la carpeta `\sources`, archivos vitales serán puestos en cuarentena de forma silenciosa, resultando en una ISO corrupta que fallará durante la instalación de Windows.
