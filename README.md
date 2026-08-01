@@ -1,4 +1,4 @@
-# IsoCore v1.0.0 by SOFTMAXTER
+# IsoCore v1.1.0 by SOFTMAXTER
 
 <p align="center">
   <img width="350" height="150" alt="IsoCore Logo" src="https://github.com/user-attachments/assets/2672db7d-05d8-4666-a880-7ef9234fc242" />
@@ -10,7 +10,8 @@
 La herramienta está dirigida a ingenieros de sistemas, administradores de TI, técnicos de soporte y entusiastas del *modding* o *sysprep* de Windows (OEM customization). IsoCore resuelve la complejidad de empaquetar imágenes personalizadas (`.wim` o `.esd`), permitiendo inyectar respuestas desatendidas (OOBE) e integrar de forma transparente paquetes de personalización de marca o scripts de post-instalación. El proceso se ejecuta de forma fluida y optimizada.
 
 ## Características Principales
-* **Arranque Dual Híbrido Estricto:** Generación de imágenes con sectores de arranque duales utilizando los binarios nativos del ADK: `etfsboot.com` (BIOS) y `efisys.bin` (UEFI), asegurando compatibilidad con hardware moderno y heredado.
+* **Arranque Dual Híbrido Estricto:** Generación de imágenes con sectores de arranque duales utilizando los binarios nativos del ADK: `etfsboot.com` (BIOS) y `efisys.bin`/`efisys_noprompt.bin` (UEFI), con soporte para arquitecturas x86, x64 y ARM64 (perfil UEFI-only forzado en fuentes ARM64), asegurando compatibilidad con hardware moderno y heredado.
+* **Verificación de Integridad del Motor:** Antes de cada ejecución, IsoCore calcula el hash SHA-256 de `oscdimg.exe` y valida su firma Authenticode. Si no puede confirmarse una firma Microsoft válida, se advierte al usuario y se solicita confirmación explícita antes de continuar.
 * **Análisis DISM Inteligente:** Extracción de metadatos profundos de la imagen origen (`install.wim` o `install.esd`). El sistema autogenera etiquetas de volumen precisas basándose en la arquitectura, edición y lenguaje (ej. `CCCOMA_X64FRE_EN-US_DV9`).
 * **Procesamiento en Segundo Plano:** El cálculo de directorios, la lectura en vivo de los logs del motor de compilación (`oscdimg.exe`) y la generación de hashes operan de manera transparente sin interrumpir el uso de la aplicación principal.
 * **Inyección Automatizada OOBE:** Capacidad de seleccionar un archivo XML de respuesta desatendida (`autounattend.xml`) e inyectarlo dinámicamente en la raíz del medio de instalación temporal antes de la compilación.
