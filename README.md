@@ -1,4 +1,4 @@
-# IsoCore v1.1.0 by SOFTMAXTER
+# IsoCore v1.3.1 by SOFTMAXTER
 
 <p align="center">
   <img width="350" height="150" alt="IsoCore Logo" src="https://github.com/user-attachments/assets/2672db7d-05d8-4666-a880-7ef9234fc242" />
@@ -13,6 +13,7 @@ La herramienta está dirigida a ingenieros de sistemas, administradores de TI, t
 * **Arranque Dual Híbrido Estricto:** Generación de imágenes con sectores de arranque duales utilizando los binarios nativos del ADK: `etfsboot.com` (BIOS) y `efisys.bin`/`efisys_noprompt.bin` (UEFI), con soporte para arquitecturas x86, x64 y ARM64 (perfil UEFI-only forzado en fuentes ARM64), asegurando compatibilidad con hardware moderno y heredado.
 * **Verificación de Integridad del Motor:** Antes de cada ejecución, IsoCore calcula el hash SHA-256 de `oscdimg.exe` y valida su firma Authenticode. Si no puede confirmarse una firma Microsoft válida, se advierte al usuario y se solicita confirmación explícita antes de continuar.
 * **Análisis DISM Inteligente:** Extracción de metadatos profundos de la imagen origen (`install.wim` o `install.esd`). El sistema autogenera etiquetas de volumen precisas basándose en la arquitectura, edición y lenguaje (ej. `CCCOMA_X64FRE_EN-US_DV9`).
+* **Pestaña "Info WIM / ESD" (Diagnóstico Avanzado):** Módulo independiente (`IsoCore.ImageInfo.psm1`) para inspeccionar cualquier `.wim`/`.esd` por unidad, carpeta o archivo. Lista todos los índices (Nombre, Tamaño, Arquitectura, Versión, Build, Idiomas) con filtros, búsqueda y ordenamiento por columna. Incluye comparación entre dos imágenes, inventario de paquetes por índice, verificación DISM completa del archivo y exportación del reporte a CSV/HTML/JSON. Si el módulo no está presente junto al script, la pestaña se degrada a un aviso con opción de reintento, sin afectar el resto de la aplicación.
 * **Procesamiento en Segundo Plano:** El cálculo de directorios, la lectura en vivo de los logs del motor de compilación (`oscdimg.exe`) y la generación de hashes operan de manera transparente sin interrumpir el uso de la aplicación principal.
 * **Inyección Automatizada OOBE:** Capacidad de seleccionar un archivo XML de respuesta desatendida (`autounattend.xml`) e inyectarlo dinámicamente en la raíz del medio de instalación temporal antes de la compilación.
 * **Integración Nativa con MRP:** Módulo dedicado para la búsqueda, extracción y despliegue automático de paquetes *Multi OEM/Retail Project* directamente en el directorio `\sources` de la imagen. 
@@ -41,7 +42,8 @@ Para un despliegue adecuado y detección automática de componentes (como herram
     │   └── Archivo_MRP.zip    <-- Archivo comprimido del paquete Multi OEM/Retail Project
     └── Script/
         │
-        ├── IsoCore.ps1        <-- Código fuente principal de la aplicación
+        ├── IsoCore.ps1                 <-- Código fuente principal de la aplicación
+        └── IsoCore.ImageInfo.psm1      <-- Módulo opcional: pestaña "Info WIM / ESD" (Diagnóstico)
 
 ### Flujo de Ejecución y Menú Principal
 1. **Configuración de Imagen:** Utiliza el explorador para definir la **Carpeta Origen** (debe contener la estructura extraída de una ISO de Windows: `boot\`, `efi\`, `sources\`). Luego, define la ruta de salida del **Archivo ISO Destino**.
