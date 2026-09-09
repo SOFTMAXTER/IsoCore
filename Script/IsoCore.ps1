@@ -5,7 +5,7 @@
 #   | |\__ \ (_) | |__| (_) | | |  __/
 #  |___|___/\___/ \____\___/|_|  \___|
 #                                     
-#  IsoCore v1.1.0
+#  IsoCore v1.3.1
 #  Author: SOFTMAXTER
 #
 #  DESCRIPTION:
@@ -18,7 +18,7 @@
 
 function Invoke-IsoCoreInternal {
 
-$script:IsoCore_Version = "1.1.0"
+$script:IsoCore_Version = "1.3.1"
 
 function Write-IsoCoreLog {
     [CmdletBinding()]
@@ -177,6 +177,15 @@ function Show-IsoCoreGUI {
     # ------------------------------------------------------------------
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+
+    # Rutas ancladas al script: no dependen del directorio de la consola.
+    # La carga se realiza despues de crear la pestaña de diagnostico.
+    $imageInfoModuleCandidates = @(
+        (Join-Path -Path $scriptPath  -ChildPath 'Modules\IsoCore.ImageInfo.psm1'),
+        (Join-Path -Path $projectRoot -ChildPath 'Modules\IsoCore.ImageInfo.psm1'),
+        (Join-Path -Path $scriptPath  -ChildPath 'IsoCore.ImageInfo.psm1'),
+        (Join-Path -Path $projectRoot -ChildPath 'IsoCore.ImageInfo.psm1')
+    ) | Select-Object -Unique
 
 # Verificar identidad e integridad del motor antes de utilizarlo.
 $oscdimgHash = $null
@@ -936,7 +945,106 @@ $btnOpenFolder.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 15)
 [void]$rootLayout.Controls.Add($actionLayout, 0, 2)
 [void]$rootLayout.Controls.Add($btnOpenFolder, 0, 3)
 
-[void]$form.Controls.Add($rootLayout)
+# ------------------------------------------------------------------
+# Pestañas de IsoCore
+# ------------------------------------------------------------------
+$tabControl = New-Object System.Windows.Forms.TabControl
+$tabControl.Dock = 'Fill'
+$tabControl.BackColor = $uiBg
+$tabControl.ForeColor = $uiText
+$tabControl.Padding = New-Object System.Drawing.Point(14, 5)
+
+$tabGenerator = New-Object System.Windows.Forms.TabPage
+$tabGenerator.Text = 'Generador ISO'
+$tabGenerator.BackColor = $uiBg
+$tabGenerator.ForeColor = $uiText
+$tabGenerator.UseVisualStyleBackColor = $false
+$tabGenerator.Padding = New-Object System.Windows.Forms.Padding(0)
+[void]$tabGenerator.Controls.Add($rootLayout)
+[void]$tabControl.TabPages.Add($tabGenerator)
+
+$imageInfoState = @{ Page = $null }
+$imageInfoLogCommand = Get-Command Write-IsoCoreLog -CommandType Function
+$imageInfoLogAction = {
+    param([string]$Level, [string]$Message)
+    try { & $imageInfoLogCommand -LogLevel $Level -Message $Message } catch {}
+}.GetNewClosure()
+
+# La pestaña existe siempre, incluso si falta el modulo o falla su importacion.
+$imageInfoPlaceholder = New-Object System.Windows.Forms.TabPage
+$imageInfoPlaceholder.Name = 'IsoCoreImageInfoDiagnostic'
+$imageInfoPlaceholder.Text = 'Info WIM / ESD'
+$imageInfoPlaceholder.BackColor = $uiBg
+$imageInfoPlaceholder.ForeColor = $uiText
+$imageInfoPlaceholder.UseVisualStyleBackColor = $false
+$imageInfoPlaceholder.Padding = New-Object System.Windows.Forms.Padding(16)
+
+$imageInfoDiagnosticLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$imageInfoDiagnosticLayout.Dock = 'Fill'
+$imageInfoDiagnosticLayout.ColumnCount = 1
+$imageInfoDiagnosticLayout.RowCount = 2
+[void]$imageInfoDiagnosticLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$imageInfoDiagnosticLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$imageInfoDiagnosticLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$imageInfoDiagnostic = New-Object System.Windows.Forms.TextBox
+$imageInfoDiagnostic.Name = 'ImageInfoLoadError'
+$imageInfoDiagnostic.Multiline = $true
+$imageInfoDiagnostic.ReadOnly = $true
+$imageInfoDiagnostic.Dock = 'Fill'
+$imageInfoDiagnostic.ScrollBars = 'Both'
+$imageInfoDiagnostic.BackColor = $uiPanel
+$imageInfoDiagnostic.ForeColor = $uiOrange
+$imageInfoDiagnostic.Text = 'Cargando el visor WIM/ESD...'
+
+$imageInfoRetry = New-Object System.Windows.Forms.Button
+$imageInfoRetry.Text = 'Reintentar carga'
+$imageInfoRetry.AutoSize = $true
+$imageInfoRetry.BackColor = $uiCyan
+$imageInfoRetry.ForeColor = [System.Drawing.Color]::Black
+$imageInfoRetry.FlatStyle = 'Flat'
+[void]$imageInfoDiagnosticLayout.Controls.Add($imageInfoDiagnostic, 0, 0)
+[void]$imageInfoDiagnosticLayout.Controls.Add($imageInfoRetry, 0, 1)
+[void]$imageInfoPlaceholder.Controls.Add($imageInfoDiagnosticLayout)
+[void]$tabControl.TabPages.Add($imageInfoPlaceholder)
+
+$loadImageInfoTab = {
+    if ($null -ne $imageInfoState.Page) { return }
+    $loadErrors = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in $imageInfoModuleCandidates) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $loadedPage = $null
+        try {
+            $infoModule = Import-Module -Name $candidate -Scope Local -Force -PassThru -ErrorAction Stop
+            $factory = $infoModule.ExportedCommands['New-IsoCoreImageInfoTab']
+            if ($null -eq $factory) { throw 'El modulo no exporta New-IsoCoreImageInfoTab.' }
+            $loadedPage = & $factory -Palette $palette -LogAction $imageInfoLogAction -ErrorAction Stop
+            if ($loadedPage -isnot [System.Windows.Forms.TabPage]) {
+                throw 'El modulo no devolvio una pestaña valida.'
+            }
+            $wasSelected = ($tabControl.SelectedTab -eq $imageInfoPlaceholder)
+            [void]$tabControl.TabPages.Add($loadedPage)
+            $tabControl.TabPages.Remove($imageInfoPlaceholder)
+            $imageInfoState.Page = $loadedPage
+            if ($wasSelected) { $tabControl.SelectedTab = $loadedPage }
+            & $imageInfoLogAction 'INFO' "IsoCore: visor WIM/ESD cargado desde $candidate."
+            return
+        } catch {
+            if ($loadedPage -is [System.Windows.Forms.TabPage]) {
+                try { $loadedPage.Dispose() } catch {}
+            }
+            [void]$loadErrors.Add("$candidate`r`n$($_.Exception.Message)")
+        }
+    }
+    $reason = if ($loadErrors.Count -gt 0) { $loadErrors -join "`r`n`r`n" } else { 'No se encontro IsoCore.ImageInfo.psm1.' }
+    $imageInfoDiagnostic.Text = "No se pudo cargar el visor WIM/ESD.`r`n`r`n$reason`r`n`r`n" +
+        "Extrae ambos archivos del paquete. Coloca Modules\IsoCore.ImageInfo.psm1 junto a IsoCore.ps1 y pulsa Reintentar carga.`r`n`r`n" +
+        "Rutas comprobadas:`r`n" + ($imageInfoModuleCandidates -join "`r`n")
+    & $imageInfoLogAction 'ERROR' "IsoCore: fallo al cargar el visor WIM/ESD. $reason"
+}.GetNewClosure()
+$imageInfoRetry.Add_Click({ & $loadImageInfoTab }.GetNewClosure())
+& $loadImageInfoTab
+
+[void]$form.Controls.Add($tabControl)
 $form.ResumeLayout($true)
 
     $uiToolTip = New-Object System.Windows.Forms.ToolTip
@@ -3683,6 +3791,16 @@ Write-IsoCoreLog -LogLevel ACTION -Message 'IsoCore: ISO verificada y transaccio
     $form.Add_FormClosing({
         param($sender, $e)
 
+        # El visor finaliza la consulta actual y libera su montaje antes de cerrar.
+        if ($null -ne $imageInfoState.Page -and $null -ne $imageInfoState.Page.Tag -and
+            $null -ne $imageInfoState.Page.Tag.CanClose) {
+            if (-not (& $imageInfoState.Page.Tag.CanClose)) {
+                $e.Cancel = $true
+                $tabControl.SelectedTab = $imageInfoState.Page
+                return
+            }
+        }
+
         # Cleanup incondicional: runspaces de analisis en background (DISM y Tamaño)
         foreach ($t in @($script:IsoCore_sizeTimer, $script:IsoCore_dismTimer)) {
             if ($null -ne $t) { try { $t.Stop(); $t.Dispose() } catch {} }
@@ -3766,8 +3884,18 @@ Write-IsoCoreLog -LogLevel ACTION -Message 'IsoCore: ISO verificada y transaccio
     # ------------------------------------------------------------------
     # 9. Mostrar y limpiar
     # ------------------------------------------------------------------
-    $form.ShowDialog() | Out-Null
-    $form.Dispose()
+    try {
+        $form.ShowDialog() | Out-Null
+    } finally {
+        # Se limpia al terminar ShowDialog, nunca si el usuario cancela el cierre.
+        if ($null -ne $imageInfoState.Page -and $null -ne $imageInfoState.Page.Tag) {
+            try { & $imageInfoState.Page.Tag.Cleanup } catch {
+                Write-IsoCoreLog -LogLevel WARN -Message "IsoCore: error cerrando el visor WIM/ESD: $($_.Exception.Message)"
+            }
+        }
+        $form.Dispose()
+        $imageInfoPlaceholder.Dispose()
+    }
     [GC]::Collect()
 }
 
