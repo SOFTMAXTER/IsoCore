@@ -1,4 +1,4 @@
-# IsoCore v1.3.1 by SOFTMAXTER
+# IsoCore v1.3.5 by SOFTMAXTER
 
 <p align="center">
   <img width="350" height="150" alt="IsoCore Logo" src="https://github.com/user-attachments/assets/2672db7d-05d8-4666-a880-7ef9234fc242" />
@@ -14,6 +14,7 @@ La herramienta está dirigida a ingenieros de sistemas, administradores de TI, t
 * **Verificación de Integridad del Motor:** Antes de cada ejecución, IsoCore calcula el hash SHA-256 de `oscdimg.exe` y valida su firma Authenticode. Si no puede confirmarse una firma Microsoft válida, se advierte al usuario y se solicita confirmación explícita antes de continuar.
 * **Análisis DISM Inteligente:** Extracción de metadatos profundos de la imagen origen (`install.wim` o `install.esd`). El sistema autogenera etiquetas de volumen precisas basándose en la arquitectura, edición y lenguaje (ej. `CCCOMA_X64FRE_EN-US_DV9`).
 * **Pestaña "Info WIM / ESD" (Diagnóstico Avanzado):** Módulo independiente (`IsoCore.ImageInfo.psm1`) para inspeccionar cualquier `.wim`/`.esd` por unidad, carpeta o archivo. Lista todos los índices (Nombre, Tamaño, Arquitectura, Versión, Build, Idiomas) con filtros, búsqueda y ordenamiento por columna. Incluye comparación entre dos imágenes, inventario de paquetes por índice, verificación DISM completa del archivo y exportación del reporte a CSV/HTML/JSON. Si el módulo no está presente junto al script, la pestaña se degrada a un aviso con opción de reintento, sin afectar el resto de la aplicación.
+* **Consultas DISM Aisladas y Resilientes:** Cada operación de la pestaña "Info WIM / ESD" (montajes de solo lectura, `Get-WindowsImage`, exportaciones, consultas de registro offline) se ejecuta en un proceso hijo controlado con límite de tiempo y cancelación segura, evitando que una consulta colgada bloquee la interfaz. Cada operación genera su propio registro DISM y un diagnóstico independiente en la carpeta `Logs/` (`DISM_InfoWIM_*.log` / `InfoWIM_*.txt`), y toda liberación de montaje pendiente se reintenta con un presupuesto de limpieza dedicado antes de reportar el resultado.
 * **Procesamiento en Segundo Plano:** El cálculo de directorios, la lectura en vivo de los logs del motor de compilación (`oscdimg.exe`) y la generación de hashes operan de manera transparente sin interrumpir el uso de la aplicación principal.
 * **Inyección Automatizada OOBE:** Capacidad de seleccionar un archivo XML de respuesta desatendida (`autounattend.xml`) e inyectarlo dinámicamente en la raíz del medio de instalación temporal antes de la compilación.
 * **Integración Nativa con MRP:** Módulo dedicado para la búsqueda, extracción y despliegue automático de paquetes *Multi OEM/Retail Project* directamente en el directorio `\sources` de la imagen. 
@@ -37,6 +38,7 @@ Para un despliegue adecuado y detección automática de componentes (como herram
     TuCarpetaPrincipal/
     │
     ├── IsoCore.exe            <-- Ejecutable Lanzador
+    ├── LICENSE.txt            <-- Licencia MIT del proyecto
     ├── Tools/                 <-- Directorio clave para dependencias:
     │   ├── oscdimg.exe        <-- (Ver aclaración en sección Requisitos)
     │   └── Archivo_MRP.zip    <-- Archivo comprimido del paquete Multi OEM/Retail Project
@@ -90,6 +92,10 @@ Para agilizar la resolución, por favor sigue estos pasos al abrir un *Issue* en
 1. **Fallo de Compilación:** Si la creación de la ISO falla, utiliza el botón **"Exportar Log"** en la interfaz para guardar el archivo `.txt` y adjúntalo a tu reporte.
 2. **Fallo de la Interfaz/Script:** Si el error ocurre antes de compilar (ej. no se detecta la carpeta, falla el análisis), dirígete a la carpeta `Logs/` dentro del directorio del proyecto y adjunta el archivo **`Registro.log`**.
 3. **Detalles del Entorno:** Incluye siempre tu versión de Windows, la versión del ADK que tienes instalada y los pasos exactos que realizaste antes de que ocurriera el fallo.
+4. **Fallo en la Pestaña "Info WIM / ESD":** Cada consulta (lectura, comparación, inventario o verificación) genera su propio par de archivos en `Logs/`: un registro DISM (`DISM_InfoWIM_*.log`) y un diagnóstico de la operación (`InfoWIM_*.txt`). Adjunta ambos archivos correspondientes al momento del fallo.
+
+## Licencia
+Este proyecto se distribuye bajo la **Licencia MIT**. Consulta el archivo [`LICENSE.txt`](./LICENSE.txt) incluido en la raíz del repositorio para el texto completo.
 
 ## Descargo de Responsabilidad
 Este script y su código fuente se proporcionan "tal cual" (as is), sin garantías de ningún tipo, explícitas o implícitas, incluyendo pero no limitándose a las garantías de comerciabilidad e idoneidad para un propósito particular. El autor (SOFTMAXTER) no asume ninguna responsabilidad por pérdida de datos, imágenes ISO corruptas, interrupción de la actividad comercial o cualquier fallo en el despliegue del sistema operativo resultante del uso o incapacidad de uso de esta herramienta. Se recomienda encarecidamente probar exhaustivamente cualquier imagen generada en un entorno de máquina virtual (Hyper-V, VirtualBox, VMware) antes de su implementación en equipos físicos o entornos de producción.
