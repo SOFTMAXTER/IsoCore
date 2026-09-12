@@ -1,4 +1,4 @@
-﻿# IsoCore.ImageInfo v1.3.1 - Windows PowerShell 5.1; UTF-8 con BOM.
+﻿# IsoCore.ImageInfo v1.3.6 - Windows PowerShell 5.1; UTF-8 con BOM.
 $script:IsoInfoModulePath = $PSCommandPath
 
 function Get-IsoInfoProperty {
@@ -104,24 +104,289 @@ function ConvertTo-IsoInfoNativeArgument {
     return '"' + ([regex]::Replace(([regex]::Replace($Value, '(\\*)"', '$1$1\"')), '(\\+)$', '$1$1')) + '"'
 }
 
-function Invoke-IsoInfoNative {
-    param([ValidateSet('dism.exe','reg.exe')][string]$Name, [string[]]$Arguments)
-    $systemFolder = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { 'Sysnative' } else { 'System32' }
-    $executable = Join-Path (Join-Path $env:WINDIR $systemFolder) $Name
-    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "No se encontró $Name en Windows." }
-    $process = New-Object Diagnostics.Process
+function New-IsoInfoLogSession {
+    param($Shared, [string]$Operation = 'Consulta', [string]$ImagePath = '')
+    if ($null -ne $Shared -and $Shared.LogPath -and $Shared.DiagnosticPath) {
+        return [pscustomobject]@{ LogPath = $Shared.LogPath; DiagnosticPath = $Shared.DiagnosticPath }
+    }
+    $directory = if ($null -ne $Shared) { [string]$Shared.LogDirectory } else { '' }
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        $appFolder = Split-Path -Parent $script:IsoInfoModulePath
+        if ((Split-Path -Leaf $appFolder) -ieq 'Modules') { $appFolder = Split-Path -Parent $appFolder }
+        $directory = Join-Path $appFolder 'Logs'
+    }
+    $directory = [IO.Path]::GetFullPath($directory)
+    $name = ($Operation -replace '[^a-zA-Z0-9_-]', '_')
+    $id = [datetime]::UtcNow.ToString('yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8)
+    $logPath = Join-Path $directory "DISM_InfoWIM_${name}_${id}.log"
+    $diagnosticPath = Join-Path $directory "InfoWIM_${name}_${id}.txt"
     try {
-        $process.StartInfo.FileName = $executable
+        [void][IO.Directory]::CreateDirectory($directory)
+        # Comprobar escritura antes de iniciar DISM; no volver al log de Windows.
+        $stream = [IO.File]::Open($logPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+        $stream.Dispose()
+        $text = "IsoCore 1.3.6 - $Operation`r`nInicio UTC: $([datetime]::UtcNow.ToString('o'))`r`nArchivo: $ImagePath`r`nRegistro DISM: $logPath`r`n"
+        [IO.File]::WriteAllText($diagnosticPath,$text,(New-Object Text.UTF8Encoding($true)))
+    } catch { throw "No se puede escribir el registro DISM en $directory. $($_.Exception.Message)" }
+    if ($null -ne $Shared) {
+        $Shared.LogPath = $logPath; $Shared.DiagnosticPath = $diagnosticPath
+        if ($null -ne $Shared.Events) { Send-IsoInfoEvent $Shared 'Diagnostic' $diagnosticPath }
+    }
+    return [pscustomobject]@{ LogPath = $logPath; DiagnosticPath = $diagnosticPath }
+}
+
+function Write-IsoInfoDiagnostic {
+    param($Shared, [string]$Message)
+    if ($null -ne $Shared -and $Shared.DiagnosticPath) {
+        try { [IO.File]::AppendAllText($Shared.DiagnosticPath,"$([datetime]::UtcNow.ToString('o')) $Message`r`n") } catch {}
+    }
+}
+
+function Get-IsoInfoSystemExecutable {
+    param([string]$Name)
+    $systemFolder = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { 'Sysnative' } else { 'System32' }
+    $path = Join-Path (Join-Path $env:WINDIR $systemFolder) $Name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "No se encontró $Name en Windows." }
+    return $path
+}
+
+function Invoke-IsoInfoProcess {
+    param([string]$Executable, [string[]]$Arguments, $Shared,
+        [ValidateRange(1,86400)][int]$TimeoutSeconds = 1800, [switch]$IgnoreCancellation)
+    # El runspace supervisa un proceso propio. Nunca detener procesos por nombre.
+    if (-not $IgnoreCancellation -and $null -ne $Shared -and $Shared.CancelRequested) {
+        throw [OperationCanceledException]::new('Operación cancelada antes de iniciar el proceso.')
+    }
+    $process = New-Object Diagnostics.Process
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $started = $false
+    try {
+        $process.StartInfo.FileName = $Executable
         $process.StartInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-IsoInfoNativeArgument $_ }) -join ' ')
-        $process.StartInfo.UseShellExecute = $false; $process.StartInfo.CreateNoWindow = $true
-        $process.StartInfo.RedirectStandardOutput = $true; $process.StartInfo.RedirectStandardError = $true
-        [void]$process.Start()
-        $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        $started = $process.Start()
+        if (-not $started) { throw 'No se pudo iniciar el proceso de consulta.' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        while (-not $process.WaitForExit(150)) {
+            if (-not $IgnoreCancellation -and $null -ne $Shared -and $Shared.CancelRequested) {
+                throw [OperationCanceledException]::new('Operación cancelada. Se interrumpió el proceso de consulta propio.')
+            }
+            if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                throw [TimeoutException]::new("La consulta superó el límite de $TimeoutSeconds segundos. Se interrumpió su proceso.")
+            }
+        }
+        # Un descendiente puede mantener los pipes abiertos tras salir el proceso.
+        # No usar WaitForExit() ni GetResult() sin verificar antes su terminación.
+        $drainClock = [Diagnostics.Stopwatch]::StartNew()
+        while (-not ($stdout.IsCompleted -and $stderr.IsCompleted)) {
+            if ($drainClock.Elapsed.TotalSeconds -ge 2) {
+                if ($null -ne $Shared) { $Shared.ProcessInterrupted = $true }
+                throw 'El proceso terminó pero no cerró sus canales de salida.'
+            }
+            if (-not $IgnoreCancellation -and $null -ne $Shared -and $Shared.CancelRequested) {
+                throw [OperationCanceledException]::new('Operación cancelada al finalizar la consulta.')
+            }
+            Start-Sleep -Milliseconds 25
+        }
         $output = $stdout.GetAwaiter().GetResult() + "`r`n" + $stderr.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw "$Name terminó con código $($process.ExitCode). $($output.Trim())" }
+        if ($process.ExitCode -ne 0) {
+            $detail = $output.Trim()
+            if ($detail.Length -gt 6000) { $detail = $detail.Substring($detail.Length - 6000) }
+            throw "La consulta terminó con código $($process.ExitCode). $detail"
+        }
+        if (-not $IgnoreCancellation -and $null -ne $Shared -and $Shared.CancelRequested) {
+            throw [OperationCanceledException]::new('Operación cancelada al finalizar la consulta.')
+        }
         return $output
-    } finally { $process.Dispose() }
+    } finally {
+        $stopError = ''
+        if ($started) {
+            try {
+                if (-not $process.HasExited) {
+                    if ($null -ne $Shared) { $Shared.ProcessInterrupted = $true }
+                    $process.Kill()
+                    if (-not $process.WaitForExit(3000)) { throw 'El sistema no confirmó la terminación del proceso.' }
+                }
+            } catch {
+                $stopError = "No se pudo detener el proceso propio PID $($process.Id). $($_.Exception.Message)"
+                if ($null -ne $Shared) { $Shared.UnstoppedProcessId = $process.Id }
+            }
+        }
+        $clock.Stop()
+        $process.Dispose()
+        if ($stopError) { throw $stopError }
+    }
+}
+
+function Invoke-IsoInfoNative {
+    param([ValidateSet('dism.exe','reg.exe')][string]$Name, [string[]]$Arguments,
+        $Shared, [int]$TimeoutSeconds = 120, [switch]$IgnoreCancellation)
+    if ($Name -eq 'dism.exe') {
+        $logs = New-IsoInfoLogSession $Shared
+        $Arguments = @($Arguments | Where-Object { $_ -notmatch '(?i)^/LogPath:' }) + @("/LogPath:$($logs.LogPath)")
+    }
+    Write-IsoInfoDiagnostic $Shared "Iniciando $Name. Límite: $TimeoutSeconds s."
+    try {
+        $result = Invoke-IsoInfoProcess -Executable (Get-IsoInfoSystemExecutable $Name) -Arguments $Arguments `
+            -Shared $Shared -TimeoutSeconds $TimeoutSeconds -IgnoreCancellation:$IgnoreCancellation
+        Write-IsoInfoDiagnostic $Shared "$Name finalizó correctamente."
+        return $result
+    } catch { Write-IsoInfoDiagnostic $Shared "$Name : $($_.Exception.Message)"; throw }
+}
+
+function Invoke-IsoInfoDismTask {
+    param([ValidateSet('Mount-WindowsImage','Dismount-WindowsImage','Get-WindowsImage',
+        'Get-WindowsPackage','Get-WindowsDriver','Get-WindowsOptionalFeature','Export-WindowsImage')][string]$Command,
+        [hashtable]$Parameters, $Shared, [int]$TimeoutSeconds = 1800, [switch]$IgnoreCancellation)
+    $logs = New-IsoInfoLogSession $Shared
+    $commandParameters = @{}
+    foreach ($key in $Parameters.Keys) { $commandParameters[$key] = $Parameters[$key] }
+    $commandParameters.LogPath = $logs.LogPath
+    Write-IsoInfoDiagnostic $Shared "Iniciando $Command. Límite: $TimeoutSeconds s."
+    $folder = Join-Path ([IO.Path]::GetTempPath()) ('IsoCore_Query_' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($folder)
+    $resultPath = Join-Path $folder 'result.clixml'
+    $payload = @{ Command = $Command; Parameters = $commandParameters; ResultPath = $resultPath }
+    $encodedData = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([Management.Automation.PSSerializer]::Serialize($payload)))
+    # Los datos se deserializan: rutas/nombres nunca se interpolan como código.
+    $child = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {
+    $data = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')))
+    Import-Module Dism -ErrorAction Stop
+    $allowed = @('Mount-WindowsImage','Dismount-WindowsImage','Get-WindowsImage','Get-WindowsPackage','Get-WindowsDriver','Get-WindowsOptionalFeature','Export-WindowsImage')
+    if ($data.Command -notin $allowed) { throw 'Consulta no admitida.' }
+    $command = Get-Command -Name $data.Command -Module Dism -CommandType Cmdlet,Function -ErrorAction Stop
+    $parameters = $data.Parameters
+    $result = @(& $command @parameters -ErrorAction Stop)
+    $xml = [Management.Automation.PSSerializer]::Serialize($result, 8)
+    [IO.File]::WriteAllText($data.ResultPath, $xml, [Text.Encoding]::UTF8)
+    exit 0
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'@
+    $child = $child.Replace('__PAYLOAD__', $encodedData)
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+    try {
+        $exe = Get-IsoInfoSystemExecutable 'WindowsPowerShell\v1.0\powershell.exe'
+        $null = Invoke-IsoInfoProcess -Executable $exe -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encodedCommand) `
+            -Shared $Shared -TimeoutSeconds $TimeoutSeconds -IgnoreCancellation:$IgnoreCancellation
+        if (-not [IO.File]::Exists($resultPath)) { throw 'DISM terminó sin devolver un resultado de la consulta.' }
+        $result = [Management.Automation.PSSerializer]::Deserialize([IO.File]::ReadAllText($resultPath))
+        Write-IsoInfoDiagnostic $Shared "$Command finalizó correctamente."
+        foreach ($item in $result) { $item }
+    } catch { Write-IsoInfoDiagnostic $Shared "$Command : $($_.Exception.Message)"; throw }
+    finally {
+        # Solo el archivo que escribió este proceso. Nunca tocar directorios montados.
+        if ([IO.File]::Exists($resultPath)) { try { [IO.File]::Delete($resultPath) } catch {} }
+        try { [IO.Directory]::Delete($folder, $false) } catch {}
+    }
+}
+
+function New-IsoInfoMountSession {
+    param([string]$ImagePath, [int]$Index, $Shared)
+    $folder = Join-Path ([IO.Path]::GetTempPath()) ('IsoCore_Info_' + [guid]::NewGuid().ToString('N'))
+    $mountPath = Join-Path $folder 'Mount'
+    $scratch = Join-Path $folder 'Scratch'
+    $logs = New-IsoInfoLogSession $Shared -ImagePath $ImagePath
+    $log = $logs.LogPath
+    $diagnostic = $logs.DiagnosticPath
+    [void][IO.Directory]::CreateDirectory($mountPath)
+    [void][IO.Directory]::CreateDirectory($scratch)
+    $session = [pscustomobject]@{ Folder = $folder; MountPath = $mountPath; ScratchPath = $scratch; LogPath = $log; DiagnosticPath = $diagnostic }
+    $text = "Consulta de solo lectura`r`nÍndice: $Index`r`nMontaje: $mountPath`r`nCarpeta temporal: $folder`r`n"
+    [IO.File]::AppendAllText($diagnostic,$text)
+    return $session
+}
+
+function Close-IsoInfoMountSession {
+    param($Session, $Shared,
+        [ValidateRange(1,7200)][int]$UnmountTimeoutSeconds = 900,
+        [ValidateRange(1,600)][int]$ConfirmationTimeoutSeconds = 120,
+        [ValidateRange(1,120)][int]$QueryTimeoutSeconds = 60,
+        [ValidateRange(100,5000)][int]$PollMilliseconds = 1000)
+    # Desmontar y confirmar son etapas distintas. Un timeout del cliente DISM
+    # no demuestra que la imagen siga montada ni que el desmontaje haya terminado.
+    $path = $Session.MountPath
+    $filter = { ([string]$_.Path).TrimEnd('\','/') -ieq $path.TrimEnd('\','/') -or
+        ([string]$_.MountPath).TrimEnd('\','/') -ieq $path.TrimEnd('\','/') }
+    $unmountError = ''
+    try {
+        if ($Shared.UnstoppedProcessId) { throw "La consulta PID $($Shared.UnstoppedProcessId) podría seguir activa. No se modifica su montaje." }
+        Send-IsoInfoEvent $Shared 'Current' 'Consultando el estado del montaje antes de liberarlo...'
+        $mounted = @(Invoke-IsoInfoDismTask 'Get-WindowsImage' @{ Mounted = $true } $Shared $QueryTimeoutSeconds -IgnoreCancellation | Where-Object $filter)
+        if ($mounted.Count -gt 1) { throw 'DISM devolvió varios registros para la misma ruta. No se modifica el montaje.' }
+        if ($mounted.Count -eq 1) {
+            Send-IsoInfoEvent $Shared 'Current' "Desmontando la imagen de solo lectura (límite: $UnmountTimeoutSeconds s)..."
+            try {
+                $null = Invoke-IsoInfoDismTask 'Dismount-WindowsImage' @{ Path = $path; Discard = $true;
+                    LogPath = $Session.LogPath; ScratchDirectory = $Session.ScratchPath } $Shared $UnmountTimeoutSeconds -IgnoreCancellation
+            } catch {
+                $unmountError = $_.Exception.Message
+                Write-IsoInfoDiagnostic $Shared "El comando de desmontaje no terminó normalmente. Se comprobará el estado real: $unmountError"
+            }
+        } elseif ($Shared.ProcessInterrupted) {
+            # La interrupción ocurrió antes de observar un montaje registrado.
+            throw 'La consulta fue interrumpida y DISM no registra todavía un montaje. Se conserva la ruta para revisar un posible montaje incompleto.'
+        }
+        if ($Shared.UnstoppedProcessId) { throw "La consulta PID $($Shared.UnstoppedProcessId) podría seguir activa. No se modifica su montaje." }
+        Send-IsoInfoEvent $Shared 'Current' "Confirmando la liberación del montaje (límite: $ConfirmationTimeoutSeconds s)..."
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $absent = 0; $confirmed = $false; $lastReason = 'DISM aún registra el montaje.'
+        while ($clock.Elapsed.TotalSeconds -lt $ConfirmationTimeoutSeconds) {
+            $remaining = [math]::Max(1, [int][math]::Floor($ConfirmationTimeoutSeconds - $clock.Elapsed.TotalSeconds))
+            try {
+                $mounted = @(Invoke-IsoInfoDismTask 'Get-WindowsImage' @{ Mounted = $true } $Shared ([math]::Min($QueryTimeoutSeconds,$remaining)) -IgnoreCancellation | Where-Object $filter)
+                if ($mounted.Count) {
+                    $absent = 0
+                    $lastReason = 'DISM aún registra el montaje en esa ruta.'
+                } else {
+                    $absent++
+                    $lastReason = 'Esperando una segunda consulta que confirme la ausencia del montaje.'
+                    if ($absent -ge 2) {
+                        # La eliminación no recursiva solo puede retirar una carpeta vacía.
+                        # Si conserva contenido, se espera; nunca se borra la imagen montada.
+                        $directoryPresent = $true
+                        try { $attributes = [IO.File]::GetAttributes($path) }
+                        catch [IO.FileNotFoundException] { $directoryPresent = $false }
+                        catch [IO.DirectoryNotFoundException] { $directoryPresent = $false }
+                        if ($directoryPresent) {
+                            if (($attributes -band [IO.FileAttributes]::Directory) -eq 0) { throw 'La ruta de montaje ya no es un directorio. Se conserva para revisión.' }
+                            [IO.Directory]::Delete($path, $false)
+                        }
+                        $confirmed = $true
+                        break
+                    }
+                }
+            } catch {
+                $absent = 0
+                $lastReason = $_.Exception.Message
+                Write-IsoInfoDiagnostic $Shared "Confirmación de desmontaje pendiente: $lastReason"
+            }
+            if ($Shared.UnstoppedProcessId) { throw "La consulta PID $($Shared.UnstoppedProcessId) podría seguir activa. Se conserva la ruta." }
+            $remainingMs = [int][math]::Max(0,($ConfirmationTimeoutSeconds - $clock.Elapsed.TotalSeconds) * 1000)
+            if ($remainingMs -gt 0) { Start-Sleep -Milliseconds ([math]::Min($PollMilliseconds,$remainingMs)) }
+        }
+        $clock.Stop()
+        if (-not $confirmed) {
+            $detail = if ($unmountError) { " Comando de desmontaje: $unmountError" } else { '' }
+            throw "No se confirmó un montaje ausente y una carpeta vacía dentro de $ConfirmationTimeoutSeconds s. $lastReason$detail"
+        }
+        try { [IO.Directory]::Delete($Session.ScratchPath, $false) } catch {}
+        if ($unmountError) { Write-IsoInfoDiagnostic $Shared "Liberación confirmada tras el aviso del comando: $unmountError" }
+        Write-IsoInfoDiagnostic $Shared 'Montaje liberado: dos consultas de DISM sin esa ruta y carpeta vacía o ausente. No se modificaron otros montajes.'
+    } catch {
+        $message = "No se pudo confirmar la liberación de $path. Se conserva la carpeta. $($_.Exception.Message)"
+        Write-IsoInfoDiagnostic $Shared $message
+        throw $message
+    }
 }
 
 function ConvertFrom-IsoInfoIntl {
@@ -137,7 +402,7 @@ function ConvertFrom-IsoInfoIntl {
 }
 
 function Get-IsoInfoOfflineVersion {
-    param([string]$MountPath, [string]$SystemRoot = 'Windows')
+    param([string]$MountPath, [string]$SystemRoot = 'Windows', $Shared)
     $relative = $SystemRoot.Trim('\','/')
     if (-not $relative) { $relative = 'Windows' }
     if ($relative -match '[:\\/]' -or $relative -in @('.','..')) { throw 'Directorio de Windows no válido en los metadatos.' }
@@ -150,12 +415,13 @@ function Get-IsoInfoOfflineVersion {
         foreach ($name in @('SOFTWARE','SOFTWARE.LOG1','SOFTWARE.LOG2')) {
             $file = Join-Path $source $name
             if ($name -eq 'SOFTWARE' -or (Test-Path -LiteralPath $file -PathType Leaf)) {
-                Copy-Item -LiteralPath $file -Destination (Join-Path $folder $name) -ErrorAction Stop
-                (Get-Item -LiteralPath (Join-Path $folder $name)).IsReadOnly = $false
+                Copy-Item -LiteralPath $file -Destination (Join-Path $folder $name) -Force -ErrorAction Stop
+                # Los logs del hive pueden conservar atributos Hidden/System al copiarlos.
+                (Get-Item -LiteralPath (Join-Path $folder $name) -Force -ErrorAction Stop).IsReadOnly = $false
             }
         }
         $attempted = $true
-        $null = Invoke-IsoInfoNative 'reg.exe' @('load', "HKLM\$keyName", (Join-Path $folder 'SOFTWARE'))
+        $null = Invoke-IsoInfoNative 'reg.exe' @('load', "HKLM\$keyName", (Join-Path $folder 'SOFTWARE')) -Shared $Shared
         $loaded = $true
         $rootKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
         $key = $rootKey.OpenSubKey("$keyName\Microsoft\Windows NT\CurrentVersion", $false)
@@ -170,7 +436,7 @@ function Get-IsoInfoOfflineVersion {
         if ($null -ne $key) { $key.Dispose() }
         if ($null -ne $rootKey) { $rootKey.Dispose() }
         if ($loaded) {
-            try { $null = Invoke-IsoInfoNative 'reg.exe' @('unload', "HKLM\$keyName"); $loaded = $false }
+            try { $null = Invoke-IsoInfoNative 'reg.exe' @('unload', "HKLM\$keyName") -IgnoreCancellation; $loaded = $false }
             catch { throw "No se pudo liberar HKLM\$keyName. Copia temporal conservada en $folder. $($_.Exception.Message)" }
         } elseif ($attempted) {
             # Una carga fallida no autoriza borrar una copia que pudiera seguir abierta.
@@ -179,14 +445,14 @@ function Get-IsoInfoOfflineVersion {
                 $existing = $probe.OpenSubKey($keyName, $false)
                 if ($null -ne $existing) {
                     $existing.Dispose()
-                    try { $null = Invoke-IsoInfoNative 'reg.exe' @('unload', "HKLM\$keyName") }
+                    try { $null = Invoke-IsoInfoNative 'reg.exe' @('unload', "HKLM\$keyName") -IgnoreCancellation }
                     catch { $loaded = $true; throw "Revisa HKLM\$keyName y la copia $folder. $($_.Exception.Message)" }
                 }
             } finally { $probe.Dispose() }
         }
         if (-not $loaded) {
             # Solo archivos de la carpeta de trabajo propia; nunca la imagen montada.
-            foreach ($file in @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+            foreach ($file in @(Get-ChildItem -LiteralPath $folder -File -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
             try { [IO.Directory]::Delete($folder, $false) } catch {}
         }
     }
@@ -228,28 +494,30 @@ function Invoke-IsoInfoAdvanced {
     param($Request, $Shared)
     $ErrorActionPreference = 'Stop'
     $row = $Request.Row.PSObject.Copy()
-    $mountPath = $null; $attempted = $false; $released = $false; $done = 0; $errors = 0; $outcome = 'Completo'
+    $session = $null; $attempted = $false; $done = 0; $errors = 0; $outcome = 'Completo'
     $messages = New-Object 'System.Collections.Generic.List[string]'
-    # Una segunda consulta nunca debe dejar valores anteriores como si fueran actuales.
     foreach ($field in @('DisplayVersion','DisplayVersionSource','ReleaseId','OfflineBuild','OfflineRevision','SystemUILanguage','SystemPreferredUILanguage','SystemLocale',
-        'ServicingStack','ServicingStackVersion','ServicingStackInstalled','CumulativeUpdate','CumulativeUpdateVersion','CumulativeUpdateInstalled','ServicingStatus')) { $row.$field = '' }
+        'ServicingStack','ServicingStackVersion','ServicingStackInstalled','CumulativeUpdate','CumulativeUpdateVersion','CumulativeUpdateInstalled')) { $row.$field = '' }
+    $row.ServicingStatus = 'No consultado'
+    Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = 0; Total = 5; Failures = 0 })
     try {
-        Import-Module Dism -ErrorAction Stop
         $null = Assert-IsoInfoStamp $Request.Path $Request.ExpectedStamp
         if ([IO.Path]::GetExtension($Request.Path) -ine '.wim') { throw 'Los detalles avanzados requieren WIM; DISM no monta ESD directamente.' }
-        if ($Shared.CancelRequested) { $outcome = 'Cancelado'; return }
-        $mountPath = Join-Path ([IO.Path]::GetTempPath()) ('IsoCore_Info_' + [guid]::NewGuid().ToString('N'))
-        [void][IO.Directory]::CreateDirectory($mountPath)
+        if ($Shared.CancelRequested) { throw [OperationCanceledException]::new('Análisis cancelado antes del montaje.') }
+        $session = New-IsoInfoMountSession $Request.Path $row.Index $Shared
+        $mountPath = $session.MountPath
         Send-IsoInfoEvent $Shared 'Current' 'Montando el índice en modo de solo lectura...'
         $attempted = $true
-        Mount-WindowsImage -ImagePath $Request.Path -Index $row.Index -Path $mountPath -ReadOnly -ErrorAction Stop | Out-Null
+        $null = Invoke-IsoInfoDismTask 'Mount-WindowsImage' @{ ImagePath = $Request.Path; Index = [int]$row.Index; Path = $mountPath;
+            ReadOnly = $true; Optimize = $true; LogPath = $session.LogPath; ScratchDirectory = $session.ScratchPath } $Shared
+        $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 5; Failures = $errors })
         foreach ($task in @('Idioma y configuración regional','Versión offline','Actualizaciones instaladas')) {
-            if ($Shared.CancelRequested) { $outcome = 'Cancelado'; break }
+            if ($Shared.CancelRequested) { throw [OperationCanceledException]::new('Análisis cancelado.') }
             Send-IsoInfoEvent $Shared 'Current' "Consultando $task..."
             try {
                 switch ($task) {
                     'Idioma y configuración regional' {
-                        $intl = ConvertFrom-IsoInfoIntl (Invoke-IsoInfoNative 'dism.exe' @('/English', "/Image:$mountPath", '/Get-Intl'))
+                        $intl = ConvertFrom-IsoInfoIntl (Invoke-IsoInfoNative 'dism.exe' @('/English', "/Image:$mountPath", '/Get-Intl', "/LogPath:$($session.LogPath)") -Shared $Shared -TimeoutSeconds 600)
                         foreach ($p in $intl.PSObject.Properties) { $row.($p.Name) = $p.Value }
                         if (-not $row.DefaultLanguage) {
                             $row.DefaultLanguage = $intl.SystemUILanguage
@@ -260,36 +528,54 @@ function Invoke-IsoInfoAdvanced {
                         }
                     }
                     'Versión offline' {
-                        $version = Get-IsoInfoOfflineVersion $mountPath $row.SystemRoot
+                        $version = Get-IsoInfoOfflineVersion $mountPath $row.SystemRoot -Shared $Shared
                         foreach ($p in $version.PSObject.Properties) { $row.($p.Name) = $p.Value }
                         $row.DisplayVersionSource = if ($row.DisplayVersion) { 'SOFTWARE offline: Microsoft\Windows NT\CurrentVersion\DisplayVersion' } else { 'DisplayVersion no presente en el registro offline; ReleaseId se muestra por separado.' }
                     }
                     'Actualizaciones instaladas' {
-                        $servicing = Get-IsoInfoServicing @(Get-WindowsPackage -Path $mountPath -ErrorAction Stop)
+                        $packages = @(Invoke-IsoInfoDismTask 'Get-WindowsPackage' @{ Path = $mountPath; LogPath = $session.LogPath } $Shared)
+                        $servicing = Get-IsoInfoServicing $packages
                         foreach ($p in $servicing.PSObject.Properties) { $row.($p.Name) = $p.Value }
                     }
                 }
-            } catch { $errors++; $messages.Add("${task}: $($_.Exception.Message)") }
-            $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 4; Failures = $errors })
+            } catch [OperationCanceledException] {
+                if ($task -eq 'Actualizaciones instaladas') { $row.ServicingStatus = 'Consulta cancelada' }
+                throw
+            }
+            catch [TimeoutException] {
+                if ($task -eq 'Actualizaciones instaladas') { $row.ServicingStatus = 'Tiempo agotado en la consulta' }
+                throw
+            }
+            catch {
+                $errors++; $messages.Add("${task}: $($_.Exception.Message)")
+                if ($task -eq 'Actualizaciones instaladas') { $row.ServicingStatus = 'Consulta con error' }
+            }
+            $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 5; Failures = $errors })
         }
         $null = Assert-IsoInfoStamp $Request.Path $Request.ExpectedStamp
-    } catch { $errors++; $outcome = 'Error'; $messages.Add($_.Exception.Message) }
+    } catch [OperationCanceledException] { $outcome = 'Cancelado'; $messages.Add($_.Exception.Message) }
+    catch [TimeoutException] { $errors++; $outcome = 'Tiempo agotado'; $messages.Add($_.Exception.Message) }
+    catch { $errors++; $outcome = 'Error'; $messages.Add($_.Exception.Message) }
     finally {
         if ($attempted) {
-            Send-IsoInfoEvent $Shared 'Current' 'Liberando el montaje de solo lectura...'
+            Send-IsoInfoEvent $Shared 'Current' 'Preparando la liberación del montaje de solo lectura...'
+            $Shared.InCleanup = $true
             try {
-                $mounted = @(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object { $_.Path -ieq $mountPath -or $_.MountPath -ieq $mountPath })
-                if ($mounted.Count) { Dismount-WindowsImage -Path $mountPath -Discard -ErrorAction Stop | Out-Null }
-                $released = $true
-            } catch { $errors++; $outcome = 'Error de desmontaje'; $messages.Add("No se pudo liberar $mountPath. $($_.Exception.Message)") }
-        } else { $released = $true }
-        if ($mountPath -and $released) { try { [IO.Directory]::Delete($mountPath, $false) } catch {} }
-        if ($attempted -and $released) { $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 4; Failures = $errors }) }
+                Close-IsoInfoMountSession $session $Shared
+                $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 5; Failures = $errors })
+            } catch { $errors++; $outcome = 'Montaje pendiente de revisión'; $messages.Add($_.Exception.Message) }
+            finally { $Shared.InCleanup = $false }
+        }
+        if ($outcome -eq 'Completo' -and $Shared.CancelRequested) { $outcome = 'Cancelado' }
         if ($outcome -eq 'Completo' -and $errors) { $outcome = 'Con errores' }
         $row.AdvancedStatus = $outcome; $row.AdvancedReadUtc = [datetime]::UtcNow.ToString('o'); $row.AdvancedError = $messages -join "`r`n"
+        if ($null -ne $session) {
+            try { [IO.File]::AppendAllText($session.DiagnosticPath,"Resultado: $outcome`r`n$($row.AdvancedError)`r`n") } catch {}
+            if ($messages.Count) { $row.AdvancedError += "`r`nDiagnóstico: $($session.DiagnosticPath)" }
+        }
         Send-IsoInfoEvent $Shared 'Advanced' $row
         if ($row.AdvancedError) { Send-IsoInfoEvent $Shared 'Error' $row.AdvancedError }
-        Send-IsoInfoEvent $Shared 'Finished' ([pscustomobject]@{ Outcome = $outcome; Done = $done; Total = 4; Failures = $errors; Error = $row.AdvancedError })
+        Send-IsoInfoEvent $Shared 'Finished' ([pscustomobject]@{ Outcome = $outcome; Done = $done; Total = 5; Failures = $errors; Error = $row.AdvancedError })
     }
 }
 
@@ -300,12 +586,11 @@ function Invoke-IsoInfoVerify {
     $results = New-Object 'System.Collections.Generic.List[object]'
     $method = 'DISM Export-WindowsImage -CheckIntegrity: todos los índices a una copia WIM temporal'
     try {
-        Import-Module Dism -ErrorAction Stop
         $null = Assert-IsoInfoStamp $Request.Path $Request.ExpectedStamp
         if ($Shared.CancelRequested) { $outcome = 'Cancelado'; return }
         $parent = Get-Item -LiteralPath $Request.WorkingFolder -ErrorAction Stop
         if (-not $parent.PSIsContainer) { throw 'Elige una carpeta para la copia temporal.' }
-        $indices = @(Get-WindowsImage -ImagePath $Request.Path -ErrorAction Stop | ForEach-Object { [int](Get-IsoInfoProperty $_ @('ImageIndex','Index') 0) })
+        $indices = @(Invoke-IsoInfoDismTask 'Get-WindowsImage' @{ ImagePath = $Request.Path } $Shared | ForEach-Object { [int](Get-IsoInfoProperty $_ @('ImageIndex','Index') 0) })
         if (-not $indices.Count -or @($indices | Where-Object { $_ -lt 1 }).Count -or @($indices | Sort-Object -Unique).Count -ne $indices.Count) { throw 'DISM no devolvió índices válidos para la verificación.' }
         $total = $indices.Count + 1
         foreach ($index in $indices) { $results.Add([pscustomobject]@{ Index = $index; Result = 'No verificado'; Method = $method; Error = '' }) }
@@ -317,7 +602,7 @@ function Invoke-IsoInfoVerify {
             if ($Shared.CancelRequested) { $outcome = 'Cancelado'; break }
             Send-IsoInfoEvent $Shared 'Current' "Comprobando índice $($result.Index) con DISM; creando copia temporal..."
             try {
-                Export-WindowsImage -SourceImagePath $Request.Path -SourceIndex $result.Index -DestinationImagePath $copyPath -CompressionType max -CheckIntegrity -ErrorAction Stop | Out-Null
+                $null = Invoke-IsoInfoDismTask 'Export-WindowsImage' @{ SourceImagePath = $Request.Path; SourceIndex = [int]$result.Index; DestinationImagePath = $copyPath; CompressionType = 'max'; CheckIntegrity = $true } $Shared 7200
                 $result.Result = 'Sin errores detectados por DISM'
             } catch {
                 $result.Result = 'No se pudo completar'; $result.Error = $_.Exception.Message
@@ -326,7 +611,9 @@ function Invoke-IsoInfoVerify {
             $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = $total; Failures = 0 })
         }
         $null = Assert-IsoInfoStamp $Request.Path $Request.ExpectedStamp
-    } catch { $outcome = 'Error'; $errors++; $fatal = $_.Exception.Message }
+    } catch [OperationCanceledException] { $outcome = 'Cancelado'; $fatal = $_.Exception.Message }
+    catch [TimeoutException] { $outcome = 'Tiempo agotado'; $errors++; $fatal = $_.Exception.Message }
+    catch { $outcome = 'Error'; $errors++; $fatal = $_.Exception.Message }
     finally {
         if ($folder) {
             Send-IsoInfoEvent $Shared 'Current' 'Eliminando la copia temporal de verificación...'
@@ -432,6 +719,8 @@ function Find-IsoInfoCandidates {
 
 function Send-IsoInfoEvent {
     param($Shared, [string]$Type, $Data)
+    if ($Type -eq 'Current' -or $Type -eq 'Error') { Write-IsoInfoDiagnostic $Shared ([string]$Data) }
+    if ($Type -eq 'Finished') { Write-IsoInfoDiagnostic $Shared ("Resultado: $($Data.Outcome). $($Data.Done)/$($Data.Total); errores: $($Data.Failures). $($Data.Error)") }
     $Shared.Events.Enqueue([pscustomobject]@{ Type = $Type; Data = $Data })
 }
 
@@ -449,7 +738,7 @@ function Invoke-IsoInfoRead {
             throw 'El archivo cambió desde la lectura anterior. Pulsa Leer para iniciar una lectura nueva.'
         }
         Send-IsoInfoEvent $Shared 'File' $stamp
-        $summaries = @(Get-WindowsImage -ImagePath $stamp.Path -ErrorAction Stop)
+        $summaries = @(Get-WindowsImage -ImagePath $stamp.Path -LogPath $Shared.LogPath -ErrorAction Stop)
         $seen = @{}
         foreach ($summary in $summaries) {
             $idx = [int](Get-IsoInfoProperty $summary @('ImageIndex','Index') 0)
@@ -471,12 +760,12 @@ function Invoke-IsoInfoRead {
             $idx = [int](Get-IsoInfoProperty $summary @('ImageIndex','Index'))
             Send-IsoInfoEvent $Shared 'Current' "Leyendo índice $idx..."
             try {
-                $details = @(Get-WindowsImage -ImagePath $stamp.Path -Index $idx -ErrorAction Stop)
+                $details = @(Get-WindowsImage -ImagePath $stamp.Path -Index $idx -LogPath $Shared.LogPath -ErrorAction Stop)
                 if ($details.Count -ne 1) { throw 'DISM no devolvió una ficha única para este índice.' }
                 $row = New-IsoInfoRow -Summary $summary -Image $details[0] -Status 'Correcto'
                 if (-not $row.DefaultLanguage -and -not $Shared.CancelRequested) {
                     try {
-                        $native = Invoke-IsoInfoNative 'dism.exe' @('/English','/Get-WimInfo',"/WimFile:$($stamp.Path)","/Index:$idx")
+                        $native = Invoke-IsoInfoNative 'dism.exe' @('/English','/Get-WimInfo',"/WimFile:$($stamp.Path)","/Index:$idx") -Shared $Shared
                         $languageData = Get-IsoInfoLanguageData $details[0] $native
                         $row.DefaultLanguage = $languageData.Default; $row.DefaultLanguageSource = $languageData.Source
                         $row.DefaultLanguageStatus = $languageData.Status; $row.Languages = @($languageData.Languages); $row.Language = $languageData.Text
@@ -615,7 +904,7 @@ function Write-IsoInfoReport {
                 foreach ($name in $names) { [void]$builder.Append('<td>' + [Net.WebUtility]::HtmlEncode([string]$row.$name) + '</td>') }
                 [void]$builder.Append('</tr>')
             }
-            [void]$builder.Append('</tbody></table></div><footer>IsoCore 1.3.1 · ' + [Net.WebUtility]::HtmlEncode([string]$Report.ExportedUtc) + '</footer></html>')
+            [void]$builder.Append('</tbody></table></div><footer>IsoCore 1.3.6 · ' + [Net.WebUtility]::HtmlEncode([string]$Report.ExportedUtc) + '</footer></html>')
             $content = $builder.ToString()
         }
         default { throw 'Usa una extensión .csv, .html o .json.' }
@@ -626,65 +915,63 @@ function Write-IsoInfoReport {
 function Invoke-IsoInfoInventory {
     param($Request, $Shared)
     $ErrorActionPreference = 'Stop'
-    $mountPath = $null; $mountAttempted = $false; $released = $false; $outcome = 'Completo'; $done = 0; $errors = 0
+    $session = $null; $attempted = $false; $outcome = 'Completo'; $done = 0; $errors = 0; $fatal = ''
+    Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = 0; Total = 5; Failures = 0 })
     try {
-        Import-Module Dism -ErrorAction Stop
         if ([IO.Path]::GetExtension($Request.Path) -ine '.wim') { throw 'El inventario requiere una imagen WIM. La consulta de metadatos también admite ESD.' }
-        $stamp = Get-IsoInfoFileStamp $Request.Path
-        if ($stamp.SizeBytes -ne $Request.ExpectedStamp.SizeBytes -or $stamp.ModifiedUtc -ne $Request.ExpectedStamp.ModifiedUtc) {
-            throw 'El archivo cambió. Vuelve a leerlo antes de consultar el inventario.'
-        }
-        if ($Shared.CancelRequested) { $outcome = 'Cancelado'; return }
-        $mountPath = Join-Path ([IO.Path]::GetTempPath()) ('IsoCore_Info_' + [guid]::NewGuid().ToString('N'))
-        [void][IO.Directory]::CreateDirectory($mountPath)
+        $null = Assert-IsoInfoStamp $Request.Path $Request.ExpectedStamp
+        if ($Shared.CancelRequested) { throw [OperationCanceledException]::new('Inventario cancelado antes del montaje.') }
+        $session = New-IsoInfoMountSession $Request.Path $Request.Index $Shared
+        $mountPath = $session.MountPath
         Send-IsoInfoEvent $Shared 'Current' 'Montando el índice en modo de solo lectura...'
-        $mountAttempted = $true
-        Mount-WindowsImage -ImagePath $Request.Path -Index $Request.Index -Path $mountPath -ReadOnly -ErrorAction Stop | Out-Null
+        $attempted = $true
+        $null = Invoke-IsoInfoDismTask 'Mount-WindowsImage' @{ ImagePath = $Request.Path; Index = [int]$Request.Index; Path = $mountPath;
+            ReadOnly = $true; Optimize = $true; LogPath = $session.LogPath; ScratchDirectory = $session.ScratchPath } $Shared
+        $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 5; Failures = $errors })
         foreach ($category in @('Controladores','Paquetes','Características')) {
-            if ($Shared.CancelRequested) { $outcome = 'Cancelado'; break }
+            if ($Shared.CancelRequested) { throw [OperationCanceledException]::new('Inventario cancelado.') }
             Send-IsoInfoEvent $Shared 'Current' "Consultando $category..."
             try {
-                $items = switch ($category) {
-                    'Controladores' { @(Get-WindowsDriver -Path $mountPath -All -ErrorAction Stop) }
-                    'Paquetes' { @(Get-WindowsPackage -Path $mountPath -ErrorAction Stop) }
-                    'Características' { @(Get-WindowsOptionalFeature -Path $mountPath -ErrorAction Stop) }
-                }
+                $command = switch ($category) { 'Controladores' { 'Get-WindowsDriver' } 'Paquetes' { 'Get-WindowsPackage' } 'Características' { 'Get-WindowsOptionalFeature' } }
+                $parameters = @{ Path = $mountPath; LogPath = $session.LogPath }
+                if ($category -eq 'Controladores') { $parameters.All = $true }
+                $items = @(Invoke-IsoInfoDismTask $command $parameters $Shared)
                 $rows = @(foreach ($item in $items) {
                     [pscustomobject]@{ Category = $category; Name = [string](Get-IsoInfoProperty $item @('Driver','PackageName','FeatureName'));
                         Version = [string](Get-IsoInfoProperty $item @('Version')); State = [string](Get-IsoInfoProperty $item @('PackageState','State'));
                         Provider = [string](Get-IsoInfoProperty $item @('ProviderName')); Detail = [string](Get-IsoInfoProperty $item @('OriginalFileName','ReleaseType')); Error = '' }
                 })
                 Send-IsoInfoEvent $Shared 'Inventory' ([pscustomobject]@{ Category = $category; Rows = $rows; Count = $rows.Count; Error = '' })
-            } catch {
+            } catch [OperationCanceledException] { throw }
+            catch [TimeoutException] { throw }
+            catch {
                 $errors++
                 Send-IsoInfoEvent $Shared 'Inventory' ([pscustomobject]@{ Category = $category; Rows = @(); Count = 0; Error = $_.Exception.Message })
             }
-            $done++
-            Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 4; Failures = $errors })
+            $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 5; Failures = $errors })
         }
-        if ($errors -gt 0 -and $outcome -eq 'Completo') { $outcome = 'Con errores' }
-    } catch {
-        $outcome = 'Error'
-        Send-IsoInfoEvent $Shared 'Error' $_.Exception.Message
-    } finally {
-        if ($mountAttempted) {
-            Send-IsoInfoEvent $Shared 'Current' 'Liberando el montaje de solo lectura...'
+        $null = Assert-IsoInfoStamp $Request.Path $Request.ExpectedStamp
+    } catch [OperationCanceledException] { $outcome = 'Cancelado'; $fatal = $_.Exception.Message }
+    catch [TimeoutException] { $errors++; $outcome = 'Tiempo agotado'; $fatal = $_.Exception.Message }
+    catch { $outcome = 'Error'; $errors++; $fatal = $_.Exception.Message }
+    finally {
+        if ($attempted) {
+            Send-IsoInfoEvent $Shared 'Current' 'Preparando la liberación del montaje de solo lectura...'
+            $Shared.InCleanup = $true
             try {
-                $mounted = @(Get-WindowsImage -Mounted -ErrorAction Stop | Where-Object { $_.Path -ieq $mountPath -or $_.MountPath -ieq $mountPath })
-                if ($mounted.Count -gt 0) { Dismount-WindowsImage -Path $mountPath -Discard -ErrorAction Stop | Out-Null }
-                $released = $true
-            } catch {
-                $outcome = 'Error de desmontaje'
-                Send-IsoInfoEvent $Shared 'Error' "No se pudo liberar el montaje $mountPath. $($_.Exception.Message)"
-            }
-        } else { $released = $true }
-        # Nunca borrar recursivamente una ruta que podría seguir montada.
-        if ($mountPath -and $released) { try { [IO.Directory]::Delete($mountPath, $false) } catch {} }
-        if ($mountAttempted -and $released) {
-            $done++
-            Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 4; Failures = $errors })
+                Close-IsoInfoMountSession $session $Shared
+                $done++; Send-IsoInfoEvent $Shared 'Progress' ([pscustomobject]@{ Done = $done; Total = 5; Failures = $errors })
+            } catch { $errors++; $outcome = 'Montaje pendiente de revisión'; $fatal += " $($_.Exception.Message)" }
+            finally { $Shared.InCleanup = $false }
         }
-        Send-IsoInfoEvent $Shared 'Finished' ([pscustomobject]@{ Outcome = $outcome; Done = $done; Total = 4; Failures = $errors; Error = '' })
+        if ($outcome -eq 'Completo' -and $Shared.CancelRequested) { $outcome = 'Cancelado' }
+        if ($outcome -eq 'Completo' -and $errors) { $outcome = 'Con errores' }
+        if ($null -ne $session) {
+            try { [IO.File]::AppendAllText($session.DiagnosticPath,"Resultado: $outcome`r`n$fatal`r`n") } catch {}
+            if ($fatal) { $fatal += "`r`nDiagnóstico: $($session.DiagnosticPath)" }
+        }
+        if ($fatal) { Send-IsoInfoEvent $Shared 'Error' $fatal }
+        Send-IsoInfoEvent $Shared 'Finished' ([pscustomobject]@{ Outcome = $outcome; Done = $done; Total = 5; Failures = $errors; Error = $fatal })
     }
 }
 
@@ -708,7 +995,7 @@ function Select-IsoInfoRows {
 function New-IsoInfoReport {
     param([string]$Title, [string]$Summary, [object[]]$Rows, $Sources = @(), [string]$AnalysisUtc = '')
     $times = @($Rows | ForEach-Object { Get-IsoInfoProperty $_ @('LeidoUTC'); Get-IsoInfoProperty $_ @('AdvancedReadUtc'); Get-IsoInfoProperty $_ @('VerifiedUtc') } | Where-Object { $_ } | Sort-Object)
-    [pscustomobject][ordered]@{ SchemaVersion = 2; ApplicationVersion = '1.3.1'; Title = $Title; Summary = $Summary;
+    [pscustomobject][ordered]@{ SchemaVersion = 2; ApplicationVersion = '1.3.6'; Title = $Title; Summary = $Summary;
         AnalysisUtc = $(if ($AnalysisUtc) { $AnalysisUtc } elseif ($times.Count) { $times[-1] } else { '' }); ComputerName = [Environment]::MachineName;
         ExportedUtc = [datetime]::UtcNow.ToString('o'); Sources = @($Sources); Rows = @($Rows) }
 }
@@ -780,22 +1067,83 @@ function Show-IsoInfoReport {
     } finally { $window.Dispose() }
 }
 
+function Get-IsoInfoDriveRoots {
+    foreach ($driveInfo in [IO.DriveInfo]::GetDrives()) {
+        try {
+            if ($driveInfo.Name -notmatch '^[a-z]:\\$' -or $driveInfo.DriveType -notin @('Fixed','Removable','CDRom')) { continue }
+            # Mostrar también lectores ópticos vacíos; no consultar su etiqueta ni sistema de archivos.
+            if ($driveInfo.DriveType -eq 'CDRom' -or $driveInfo.IsReady) { $driveInfo }
+        } catch { continue }
+    }
+}
+
+function Get-IsoInfoSourceDrives {
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $found = New-Object 'System.Collections.Generic.List[object]'
+    $roots = @(Get-IsoInfoDriveRoots)
+    $disks = @{}; $partitions = @()
+    if (@($roots | Where-Object { $_.DriveType -in @('Fixed','Removable') }).Count) {
+        try {
+            Import-Module Storage -ErrorAction Stop
+            foreach ($disk in @(Get-Disk -ErrorAction Stop)) {
+                if ($null -ne $disk.Number) { $disks[[string]$disk.Number] = $disk }
+            }
+            $partitions = @(Get-Partition -ErrorAction Stop)
+        } catch { $errors.Add('No se pudieron identificar los discos USB: ' + $_.Exception.Message) }
+    }
+    $seen = @{}
+    foreach ($root in $roots) {
+        try {
+            if ($root.Name -notmatch '^([a-z]):\\$' -or $root.DriveType -notin @('Fixed','Removable','CDRom')) { continue }
+            $letter = $root.Name.Substring(0,1).ToUpperInvariant()
+            if ($seen.ContainsKey($letter)) { continue }
+            $ready = [bool]$root.IsReady
+            if ($root.DriveType -eq 'CDRom') {
+                # DriveType CDRom comprende lectores físicos y unidades ópticas virtuales/ISO.
+                # Ambos están autorizados; no depender de Get-DiskImage para incluirlos.
+                $kind = 'CD/DVD / ISO'; $evidence = 'DriveInfo.DriveType: CDRom'
+            } else {
+                if (-not $ready) { continue }
+                $partition = @($partitions | Where-Object { [string]$_.DriveLetter -ieq $letter })
+                if ($partition.Count -ne 1 -or $null -eq $partition[0].DiskNumber) { continue }
+                $number = [string]$partition[0].DiskNumber
+                if (-not $disks.ContainsKey($number)) { continue }
+                $disk = $disks[$number]
+                if ($disk.IsOffline) { continue }
+                $bus = ([string]$disk.BusType -replace '[\s_-]', '').ToUpperInvariant()
+                # Solo USB para discos: no aceptar Virtual/File Backed Virtual (VHD/VHDX).
+                if ($bus -notin @('7','USB')) { continue }
+                $kind = 'USB'; $evidence = 'Get-Disk.BusType: ' + [string]$disk.BusType
+            }
+            $path = $letter + ':\'
+            $label = if ($ready) { [string]$root.VolumeLabel } else { 'Sin disco/medio' }
+            $format = if ($ready) { [string]$root.DriveFormat } else { '' }
+            if ([string]::IsNullOrWhiteSpace($label)) { $label = 'Sin etiqueta' }
+            $display = '{0} — {1} | {2}' -f $path, $kind, $label
+            if ($format) { $display += ' (' + $format + ')' }
+            $found.Add([pscustomobject]@{ Path = $path; Type = $kind; Ready = $ready; Evidence = $evidence; Display = $display })
+            $seen[$letter] = $true
+        } catch { $errors.Add('No se pudo consultar ' + [string]$root.Name + ': ' + $_.Exception.Message) }
+    }
+    [pscustomobject]@{ Drives = @($found.ToArray() | Sort-Object Path); Warnings = @($errors.ToArray()) }
+}
+
 function New-IsoCoreImageInfoTab {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Palette, [scriptblock]$LogAction)
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Palette, [scriptblock]$LogAction, [string]$LogDirectory)
     $ErrorActionPreference = 'Stop'
     $modulePath = $script:IsoInfoModulePath
     # CommandInfo mantiene el ámbito del módulo al ejecutarse eventos GetNewClosure.
     $api = @{}
     foreach ($command in @('New-IsoInfoDataset','Select-IsoInfoRows','Get-IsoInfoPercent','Format-IsoInfoBytes','Compare-IsoInfoImages',
-        'Get-IsoInfoTableRows','Write-IsoInfoReport','New-IsoInfoReport','Show-IsoInfoReport')) {
+        'Get-IsoInfoTableRows','Write-IsoInfoReport','New-IsoInfoReport','Show-IsoInfoReport','Get-IsoInfoSourceDrives')) {
         $api[$command] = Get-Command $command -CommandType Function
     }
     $tab = $null; $tip = $null; $timer = $null
     $state = @{ Busy = $false; Closing = $false; CloseRequested = $false; Muting = $false; Polling = $false;
         A = $null; B = $null; PowerShell = $null; Runspace = $null; Handle = $null; Shared = $null;
         Request = $null; Final = $null; Candidates = @(); AutoRead = $null; Sort = 'Index'; Descending = $false;
-        Done = 0; Total = 0; Failures = 0; Current = ''; Fatal = ''; Inventory = $null; InventoryResult = $null; Verification = $null; VerificationResult = $null }
+        Done = 0; Total = 0; Failures = 0; Current = ''; Fatal = ''; Clock = $null; StageClock = $null; LastHeartbeat = 0; DiagnosticPath = ''; Inventory = $null; InventoryResult = $null; Verification = $null; VerificationResult = $null }
     $actions = @{}
     try {
         $tab = New-Object System.Windows.Forms.TabPage
@@ -838,7 +1186,7 @@ function New-IsoCoreImageInfoTab {
         [void]$root.Controls.Add($title,0,0)
 
         $driveBar = & $newFlow
-        [void]$driveBar.Controls.Add((& $newLabel 'Unidad:'))
+        [void]$driveBar.Controls.Add((& $newLabel 'Unidad USB / CD-DVD / ISO:'))
         $drive = New-Object System.Windows.Forms.ComboBox
         $drive.Name = 'ImageInfoDrive'; $drive.DropDownStyle = 'DropDownList'; $drive.Width = 450
         $drive.BackColor = $Palette.Panel; $drive.ForeColor = $Palette.Text; $drive.DisplayMember = 'Display'
@@ -930,10 +1278,13 @@ function New-IsoCoreImageInfoTab {
         $retry = & $newButton 'ImageInfoRetry' 'Reintentar pendientes'
         $export = & $newButton 'ImageInfoExport' 'Exportar'
         $clear = & $newButton 'ImageInfoClear' 'Limpiar'
-        foreach ($control in @($progress,$percent,$cancel,$retry,$export,$clear)) { [void]$footerButtons.Controls.Add($control) }
+        $diagnostic = & $newButton 'ImageInfoDiagnostic' 'Ver diagnóstico'
+        foreach ($control in @($progress,$percent,$cancel,$retry,$export,$clear,$diagnostic)) { [void]$footerButtons.Controls.Add($control) }
         [void]$footer.Controls.Add($status,0,0); [void]$footer.Controls.Add($footerButtons,0,1)
         [void]$root.Controls.Add($footer,0,8); [void]$tab.Controls.Add($root)
-        $tip.SetToolTip($progress,'Avanza al terminar cada índice, incluido un intento que termine con error. No representa tiempo restante.')
+        $tip.SetToolTip($progress,'La animación indica una consulta en curso. El porcentaje cuenta índices o etapas terminadas, incluido montaje y desmontaje; no estima tiempo restante.')
+        $tip.SetToolTip($drive,'USB, lectores CD/DVD físicos y unidades ópticas virtuales/ISO. Los lectores sin medio se indican en la lista. No incluye VHD/VHDX.')
+        $tip.SetToolTip($refresh,'Actualiza el listado después de conectar un USB, insertar/retirar un CD/DVD o montar/desmontar una ISO.')
         $tip.SetToolTip($retry,'Reintenta los índices fallidos o pendientes de la imagen A; conserva los índices correctos.')
         $tip.SetToolTip($inventory,'Consulta controladores, paquetes y características del índice seleccionado; montaje WIM de solo lectura.')
         $tip.SetToolTip($advanced,'Consulta idiomas, DisplayVersion y actualizaciones del índice seleccionado. Requiere WIM y montaje de solo lectura.')
@@ -956,6 +1307,7 @@ function New-IsoCoreImageInfoTab {
             if ($state.Closing -or $tab.IsDisposed) { return }
             foreach ($control in @($path,$drive,$refresh,$browseFile,$browseFolder,$read,$candidates,$clear)) { $control.Enabled = -not $state.Busy }
             $cancel.Enabled = $state.Busy -and -not $state.Shared.CancelRequested
+            $diagnostic.Enabled = -not [string]::IsNullOrEmpty($state.DiagnosticPath)
             $hasRows = $null -ne $state.A -and $state.A.Rows.Count -gt 0
             $selected = $list.SelectedItems.Count -gt 0
             $details.Enabled = $selected
@@ -1022,19 +1374,33 @@ function New-IsoCoreImageInfoTab {
             param($Data)
             $state.Done = [int]$Data.Done; $state.Total = [int]$Data.Total; $state.Failures = [int]$Data.Failures
             $value = & $api['Get-IsoInfoPercent'] $state.Done $state.Total
-            $progress.Value = [math]::Min(100,[math]::Max(0,$value)); $percent.Text = "$($progress.Value) %"
-            $unit = if ($state.Request.Operation -in @('Inventory','Advanced','Verify')) { 'tareas' } else { 'índices' }
+            $progress.Value = [math]::Min(100,[math]::Max(0,$value))
+            $progress.Style = if ($state.Busy) { 'Marquee' } else { 'Continuous' }
+            $percent.Text = if ($state.Total -gt 0) { "$($progress.Value) %" } else { 'En curso' }
+            $unit = if ($state.Request.Operation -in @('Inventory','Advanced','Verify')) { 'etapas' } else { 'índices' }
             $prefix = if ($state.Request.Target -eq 'B') { 'Imagen B — ' } else { '' }
-            $cancelText = if ($state.Shared.CancelRequested) { 'Cancelación solicitada. Esperando la consulta actual.' } else { $state.Current }
-            & $actions.Status "${prefix}$($state.Done) de $($state.Total) $unit procesados; $($state.Failures) con error. $cancelText"
+            $count = if ($state.Total -gt 0) { "$($state.Done)/$($state.Total) $unit; $($state.Failures) con error. " } else { '' }
+            $phase = $state.Current
+            if ($state.Shared.CancelRequested) {
+                $phase = if ($state.Shared.InCleanup) { 'Cancelación solicitada. ' + $state.Current }
+                    elseif ($state.Request.Operation -in @('Advanced','Inventory','Verify')) { 'Cancelando la consulta y preparando la limpieza...' }
+                    else { 'Cancelación solicitada. Esperando la consulta actual.' }
+            }
+            $elapsed = if ($null -ne $state.Clock) { $state.Clock.Elapsed.ToString('hh\:mm\:ss') } else { '00:00:00' }
+            $phaseElapsed = if ($null -ne $state.StageClock) { $state.StageClock.Elapsed.ToString('hh\:mm\:ss') } else { '00:00:00' }
+            $message = "${prefix}${phase} ${count}Tiempo: $elapsed (etapa: $phaseElapsed)."
+            & $actions.Status $message
+            $tip.SetToolTip($status,$message)
         }.GetNewClosure()
         $actions.Start = {
             param($Request)
             if ($state.Busy -or $state.Closing) { return }
             $state.Request = $Request; $state.Final = $null; $state.Fatal = ''; $state.Current = ''; $state.AutoRead = $null
-            $state.Done = 0; $state.Total = 0; $state.Failures = 0
-            $progress.Value = 0; $percent.Text = '0 %'
-            $state.Shared = [hashtable]::Synchronized(@{ CancelRequested = $false; Events = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]') })
+            $state.Done = 0; $state.Total = if ($Request.Operation -in @('Advanced','Inventory')) { 5 } else { 0 }; $state.Failures = 0
+            $state.Clock = [Diagnostics.Stopwatch]::StartNew(); $state.StageClock = [Diagnostics.Stopwatch]::StartNew(); $state.LastHeartbeat = 0
+            $state.DiagnosticPath = ''
+            $progress.Value = 0; $progress.Style = 'Marquee'; $percent.Text = 'En curso'
+            $state.Shared = [hashtable]::Synchronized(@{ CancelRequested = $false; InCleanup = $false; ProcessInterrupted = $false; LogDirectory = $LogDirectory; Events = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]') })
             $state.Busy = $true
             & $actions.Controls
             & $actions.Status $(if ($Request.Operation -eq 'Discover') { 'Buscando imágenes WIM/ESD...' } elseif ($Request.Operation -eq 'Inventory') { 'Preparando inventario...' } elseif ($Request.Operation -eq 'Advanced') { 'Preparando análisis avanzado...' } elseif ($Request.Operation -eq 'Verify') { 'Preparando verificación DISM...' } else { 'Detectando índices...' })
@@ -1048,6 +1414,9 @@ function New-IsoCoreImageInfoTab {
                         $module = Import-Module -Name $ModulePath -Force -PassThru -ErrorAction Stop
                         & $module {
                             param($Request,$Shared)
+                            if ($Request.Operation -ne 'Discover') {
+                                $null = New-IsoInfoLogSession $Shared $Request.Operation $Request.Path
+                            }
                             switch ($Request.Operation) {
                                 'Read' { Invoke-IsoInfoRead $Request $Shared }
                                 'Inventory' { Invoke-IsoInfoInventory $Request $Shared }
@@ -1147,7 +1516,8 @@ function New-IsoCoreImageInfoTab {
                         & $actions.Progress ([pscustomobject]@{ Done = 0; Total = $evt.Data.Total; Failures = 0 })
                         $changed = $true
                     }
-                    'Current' { $state.Current = [string]$evt.Data; & $actions.Progress ([pscustomobject]@{ Done = $state.Done; Total = $state.Total; Failures = $state.Failures }) }
+                    'Diagnostic' { $state.DiagnosticPath = [string]$evt.Data; & $actions.Controls }
+                    'Current' { $state.Current = [string]$evt.Data; $state.StageClock = [Diagnostics.Stopwatch]::StartNew(); & $actions.Progress ([pscustomobject]@{ Done = $state.Done; Total = $state.Total; Failures = $state.Failures }) }
                     'Row' {
                         $row = $evt.Data.Row
                         $state[$state.Request.Target].Rows[[string]$row.Index] = $row
@@ -1184,8 +1554,23 @@ function New-IsoCoreImageInfoTab {
             if ($state.Polling -or $null -eq $state.Handle) { return }
             $state.Polling = $true
             try {
+                if ($state.Closing) {
+                    if ($state.Handle.IsCompleted) {
+                        try { $null = $state.PowerShell.EndInvoke($state.Handle) } catch {}
+                        & $actions.Release
+                        try { $state.Timer.Dispose() } catch {}
+                        try { $tip.Dispose() } catch {}
+                    }
+                    return
+                }
                 & $actions.Drain
-                if (-not $state.Handle.IsCompleted) { return }
+                if (-not $state.Handle.IsCompleted) {
+                    if ($null -ne $state.Clock -and ($state.Clock.Elapsed.TotalSeconds - $state.LastHeartbeat) -ge 1) {
+                        $state.LastHeartbeat = $state.Clock.Elapsed.TotalSeconds
+                        & $actions.Progress ([pscustomobject]@{ Done = $state.Done; Total = $state.Total; Failures = $state.Failures })
+                    }
+                    return
+                }
                 try { $null = $state.PowerShell.EndInvoke($state.Handle) }
                 catch { $state.Fatal = $_.Exception.Message; & $actions.Log 'ERROR' $state.Fatal }
                 & $actions.Drain
@@ -1251,17 +1636,20 @@ function New-IsoCoreImageInfoTab {
         $state.Timer = $timer
         $actions.Release = {
             $state.Timer.Stop()
+            if (-not $state.Closing) { $progress.Style = 'Continuous' }
+            if ($null -ne $state.Clock) { $state.Clock.Stop() }
+            if ($null -ne $state.StageClock) { $state.StageClock.Stop() }
             if ($null -ne $state.PowerShell) { try { $state.PowerShell.Dispose() } catch {} }
             if ($null -ne $state.Runspace) { try { $state.Runspace.Close(); $state.Runspace.Dispose() } catch {} }
             $state.PowerShell = $null; $state.Runspace = $null; $state.Handle = $null; $state.Busy = $false
-            & $actions.Controls
+            if (-not $state.Closing) { & $actions.Controls }
         }.GetNewClosure()
 
         $actions.Cancel = {
             if (-not $state.Busy) { return }
             $state.Shared.CancelRequested = $true
             & $actions.Controls
-            & $actions.Status 'Cancelación solicitada. Se conserva lo procesado; esperando a que termine la consulta actual.' 'Warning'
+            & $actions.Progress ([pscustomobject]@{ Done = $state.Done; Total = $state.Total; Failures = $state.Failures })
         }.GetNewClosure()
         $actions.RefreshDrives = {
             if ($state.Busy) { return }
@@ -1269,12 +1657,19 @@ function New-IsoCoreImageInfoTab {
             try {
                 $previous = if ($null -ne $drive.SelectedItem) { $drive.SelectedItem.Path } else { '' }
                 $drive.Items.Clear(); $drive.SelectedIndex = -1
-                foreach ($item in [IO.DriveInfo]::GetDrives()) {
-                    try {
-                        if (-not $item.IsReady) { continue }
-                        [void]$drive.Items.Add([pscustomobject]@{ Path = $item.RootDirectory.FullName; Display = "$($item.RootDirectory.FullName) — $($item.VolumeLabel) ($($item.DriveFormat))" })
-                        if ($item.RootDirectory.FullName -eq $previous) { $drive.SelectedIndex = $drive.Items.Count - 1 }
-                    } catch { continue }
+                $catalog = & $api['Get-IsoInfoSourceDrives']
+                foreach ($item in $catalog.Drives) {
+                    [void]$drive.Items.Add($item)
+                    if ($item.Path -ieq $previous) { $drive.SelectedIndex = $drive.Items.Count - 1 }
+                }
+                if (@($catalog.Warnings).Count) {
+                    $warning = $catalog.Warnings -join "`r`n"
+                    & $actions.Status $warning 'Warning'
+                    & $actions.Log 'WARN' $warning
+                } elseif (-not $drive.Items.Count) {
+                    & $actions.Status 'No hay unidades USB, CD/DVD o ISO disponibles. Conecta un USB o lector, o monta una ISO, y pulsa Actualizar unidades.'
+                } else {
+                    & $actions.Status "$($drive.Items.Count) unidad(es) USB, CD/DVD o ISO disponibles. Selecciona una para buscar imágenes."
                 }
             } finally { $state.Muting = $false }
         }.GetNewClosure()
@@ -1310,6 +1705,14 @@ function New-IsoCoreImageInfoTab {
         $path.Add_KeyDown({ param($sender,$eventArgs); if ($eventArgs.KeyCode -eq 'Enter') { $eventArgs.SuppressKeyPress = $true; & $actions.Discover } }.GetNewClosure())
         $read.Add_Click({ & $actions.Discover }.GetNewClosure())
         $cancel.Add_Click({ & $actions.Cancel }.GetNewClosure())
+        $diagnostic.Add_Click({
+            try {
+                if (-not [IO.File]::Exists($state.DiagnosticPath)) { throw 'El diagnóstico de esta consulta ya no está disponible.' }
+                $open = New-Object Diagnostics.ProcessStartInfo
+                $open.FileName = $state.DiagnosticPath; $open.UseShellExecute = $true
+                $null = [Diagnostics.Process]::Start($open)
+            } catch { & $actions.Status "No se pudo abrir el diagnóstico: $($_.Exception.Message)" 'Warning' }
+        }.GetNewClosure())
         $refresh.Add_Click({ & $actions.RefreshDrives }.GetNewClosure())
         $clear.Add_Click({ if (-not $state.Busy) { $path.Clear(); & $actions.Reset; & $actions.Status 'Listo. Selecciona una imagen.' } }.GetNewClosure())
         $retry.Add_Click({ if ($null -ne $state.A) { & $actions.ReadImage $state.A.Path 'A' $true } }.GetNewClosure())
@@ -1318,7 +1721,12 @@ function New-IsoCoreImageInfoTab {
         $langFilter.Add_SelectedIndexChanged({ if (-not $state.Muting) { & $actions.Render } }.GetNewClosure())
         $drive.Add_SelectedIndexChanged({
             if ($state.Muting -or $state.Busy -or $null -eq $drive.SelectedItem) { return }
-            $path.Text = $drive.SelectedItem.Path; & $actions.Reset; & $actions.Discover
+            $path.Text = $drive.SelectedItem.Path; & $actions.Reset
+            if ($drive.SelectedItem.Ready -eq $false) {
+                & $actions.Status 'La unidad no tiene un medio disponible. Inserta un CD/DVD y pulsa Actualizar unidades.'
+                return
+            }
+            & $actions.Discover
         }.GetNewClosure())
         $candidates.Add_SelectedIndexChanged({
             if ($state.Muting -or $state.Busy -or $null -eq $candidates.SelectedItem) { return }
@@ -1412,8 +1820,9 @@ function New-IsoCoreImageInfoTab {
             $state.Closing = $true
             if ($null -ne $state.Shared) { $state.Shared.CancelRequested = $true }
             if ($null -ne $state.PowerShell -and $null -ne $state.Handle -and -not $state.Handle.IsCompleted) {
-                # Respaldo para Dispose externo; el cierre normal espera por CanClose.
-                try { $state.PowerShell.Stop() } catch {}
+                # Dejar que el supervisor cancele y limpie. Poll libera los recursos
+                # cuando el worker termina, sin bloquear la ventana con Stop().
+                return
             }
             & $actions.Release
             try { $state.Timer.Dispose() } catch {}

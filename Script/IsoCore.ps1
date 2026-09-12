@@ -5,7 +5,7 @@
 #   | |\__ \ (_) | |__| (_) | | |  __/
 #  |___|___/\___/ \____\___/|_|  \___|
 #                                     
-#  IsoCore v1.3.1
+#  IsoCore v1.3.5
 #  Author: SOFTMAXTER
 #
 #  DESCRIPTION:
@@ -18,7 +18,7 @@
 
 function Invoke-IsoCoreInternal {
 
-$script:IsoCore_Version = "1.3.1"
+$script:IsoCore_Version = "1.3.5"
 
 function Write-IsoCoreLog {
     [CmdletBinding()]
@@ -1007,6 +1007,7 @@ $imageInfoRetry.FlatStyle = 'Flat'
 [void]$imageInfoPlaceholder.Controls.Add($imageInfoDiagnosticLayout)
 [void]$tabControl.TabPages.Add($imageInfoPlaceholder)
 
+$imageInfoLogDirectory = $script:IsoCore_logDir
 $loadImageInfoTab = {
     if ($null -ne $imageInfoState.Page) { return }
     $loadErrors = New-Object System.Collections.Generic.List[string]
@@ -1017,7 +1018,7 @@ $loadImageInfoTab = {
             $infoModule = Import-Module -Name $candidate -Scope Local -Force -PassThru -ErrorAction Stop
             $factory = $infoModule.ExportedCommands['New-IsoCoreImageInfoTab']
             if ($null -eq $factory) { throw 'El modulo no exporta New-IsoCoreImageInfoTab.' }
-            $loadedPage = & $factory -Palette $palette -LogAction $imageInfoLogAction -ErrorAction Stop
+            $loadedPage = & $factory -Palette $palette -LogAction $imageInfoLogAction -LogDirectory $imageInfoLogDirectory -ErrorAction Stop
             if ($loadedPage -isnot [System.Windows.Forms.TabPage]) {
                 throw 'El modulo no devolvio una pestaña valida.'
             }
@@ -1537,7 +1538,10 @@ $script:IsoCore_GetSwmSetInfo = {
             $readable = $false
             $dismCmd = Get-Command dism.exe -ErrorAction SilentlyContinue
             if ($dismCmd) {
-                $dismOutput = @(& $dismCmd.Source '/English' '/Get-ImageInfo' "/ImageFile:$($result.BasePath)" "/SWMFile:$($result.Pattern)" 2>&1)
+                if ([string]::IsNullOrWhiteSpace($script:IsoCore_logDir)) { throw 'No se ha configurado la carpeta Logs para DISM.' }
+                [void][IO.Directory]::CreateDirectory($script:IsoCore_logDir)
+                $dismLogPath = Join-Path $script:IsoCore_logDir ('DISM_ISO_SWM_' + [datetime]::UtcNow.ToString('yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.log')
+                $dismOutput = @(& $dismCmd.Source '/English' '/Get-ImageInfo' "/ImageFile:$($result.BasePath)" "/SWMFile:$($result.Pattern)" "/LogPath:$dismLogPath" 2>&1)
                 $dismExitCode = $LASTEXITCODE
                 if ($dismExitCode -eq 0) {
                     $result.ImageCount = @($dismOutput | Where-Object { [string]$_ -match '^\s*Index\s*:' }).Count
@@ -2086,6 +2090,7 @@ $script:IsoCore_TestIsoImage = {
             $script:IsoCore_dismRS.SessionStateProxy.SetVariable('targetImage', $targetImage)
             $script:IsoCore_dismRS.SessionStateProxy.SetVariable('langIniPath', $langIniPath)
             $script:IsoCore_dismRS.SessionStateProxy.SetVariable('dismQueue',   $script:IsoCore_dismQueue)
+            $script:IsoCore_dismRS.SessionStateProxy.SetVariable('dismLogDirectory', $script:IsoCore_logDir)
 
             $script:IsoCore_dismPS = [powershell]::Create()
             $script:IsoCore_dismPS.Runspace = $script:IsoCore_dismRS
@@ -2102,9 +2107,12 @@ $script:IsoCore_TestIsoImage = {
                 }
                 try {
                     Import-Module Dism -ErrorAction Stop
+                    if ([string]::IsNullOrWhiteSpace($dismLogDirectory)) { throw 'No se ha configurado la carpeta Logs para DISM.' }
+                    [void][IO.Directory]::CreateDirectory($dismLogDirectory)
+                    $dismLogPath = Join-Path $dismLogDirectory ('DISM_ISO_Metadatos_' + [datetime]::UtcNow.ToString('yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.log')
 
                     $prefix    = "CCCOMA"
-                    $allImages = Get-WindowsImage -ImagePath $targetImage -ErrorAction Stop
+                    $allImages = Get-WindowsImage -ImagePath $targetImage -LogPath $dismLogPath -ErrorAction Stop
                     $allNames  = $allImages.ImageName -join " "
                     $result.ImageCount = @($allImages).Count
                     $result.ImageNames = @($allImages | ForEach-Object { $_.ImageName })
@@ -2113,7 +2121,7 @@ $script:IsoCore_TestIsoImage = {
                     elseif ($allNames -match "Enterprise.*LTSC|LTSC.*Enterprise") { $prefix = "CCCEA" }
                     elseif ($allNames -match "Enterprise")                        { $prefix = "CCCEA" }
 
-                    $detailedImage = Get-WindowsImage -ImagePath $targetImage -Index 1 -ErrorAction Stop
+                    $detailedImage = Get-WindowsImage -ImagePath $targetImage -Index 1 -LogPath $dismLogPath -ErrorAction Stop
 
                     $archRaw = [string]$detailedImage.Architecture
                     $archStr = switch -Regex ($archRaw.Trim().ToUpperInvariant()) {
