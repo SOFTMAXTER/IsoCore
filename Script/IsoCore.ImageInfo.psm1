@@ -1,4 +1,4 @@
-﻿# IsoCore.ImageInfo v1.3.6 - Windows PowerShell 5.1; UTF-8 con BOM.
+﻿# IsoCore.ImageInfo v1.3.8 - Windows PowerShell 5.1; UTF-8 con BOM.
 $script:IsoInfoModulePath = $PSCommandPath
 
 function Get-IsoInfoProperty {
@@ -125,7 +125,7 @@ function New-IsoInfoLogSession {
         # Comprobar escritura antes de iniciar DISM; no volver al log de Windows.
         $stream = [IO.File]::Open($logPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
         $stream.Dispose()
-        $text = "IsoCore 1.3.6 - $Operation`r`nInicio UTC: $([datetime]::UtcNow.ToString('o'))`r`nArchivo: $ImagePath`r`nRegistro DISM: $logPath`r`n"
+        $text = "IsoCore 1.3.8 - $Operation`r`nInicio UTC: $([datetime]::UtcNow.ToString('o'))`r`nArchivo: $ImagePath`r`nRegistro DISM: $logPath`r`n"
         [IO.File]::WriteAllText($diagnosticPath,$text,(New-Object Text.UTF8Encoding($true)))
     } catch { throw "No se puede escribir el registro DISM en $directory. $($_.Exception.Message)" }
     if ($null -ne $Shared) {
@@ -150,9 +150,65 @@ function Get-IsoInfoSystemExecutable {
     return $path
 }
 
+function New-IsoInfoProcessChannel {
+    param([IO.StreamReader]$Reader)
+    $buffer = New-Object char[] 4096
+    [pscustomobject]@{ Reader = $Reader; Buffer = $buffer; Text = (New-Object Text.StringBuilder);
+        Fragment = ''; Completed = $false; Pending = $Reader.ReadAsync($buffer, 0, $buffer.Length) }
+}
+
+function Receive-IsoInfoPercentText {
+    param($Shared, [string]$ActivityId, [string]$Text,
+        [ValidateSet('None','Native','Record')][string]$ProgressMode = 'None')
+    if (-not $ActivityId -or $ProgressMode -eq 'None') { return }
+    $pattern = if ($ProgressMode -eq 'Record') { '(?m)^ISOINFO_PROGRESS:(?<percent>\d{1,3})\r?$' }
+        else { '(?<![\d.,+\-])(?<percent>\d{1,3}(?:[.,]\d+)?)\s*%' }
+    foreach ($match in [regex]::Matches($Text, $pattern)) {
+        $value = 0.0
+        if ([double]::TryParse($match.Groups['percent'].Value.Replace(',', '.'),
+            [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+            Set-IsoInfoDismPercent $Shared $ActivityId $value
+        }
+    }
+}
+
+function Receive-IsoInfoProcessChannel {
+    param($Channel, $Shared, [string]$ActivityId = '',
+        [ValidateSet('None','Native','Record')][string]$ProgressMode = 'None')
+    # Una lectura pendiente por canal; no esperar tareas incompletas ni ejecutar
+    # scriptblocks en hilos nativos. El límite deja atender timeout/cancelación.
+    for ($i = 0; $i -lt 32 -and -not $Channel.Completed -and $Channel.Pending.IsCompleted; $i++) {
+        $count = $Channel.Pending.GetAwaiter().GetResult()
+        if ($count -eq 0) {
+            $Channel.Completed = $true
+            Receive-IsoInfoPercentText $Shared $ActivityId $Channel.Fragment $ProgressMode
+            $Channel.Fragment = ''
+            break
+        }
+        $chunk = [string]::new($Channel.Buffer, 0, $count)
+        [void]$Channel.Text.Append($chunk)
+        if ($ProgressMode -ne 'None') {
+            $Channel.Fragment += $chunk
+            $end = $Channel.Fragment.LastIndexOfAny([char[]]"`r`n") + 1
+            if ($end -gt 0) {
+                Receive-IsoInfoPercentText $Shared $ActivityId $Channel.Fragment.Substring(0, $end) $ProgressMode
+                $Channel.Fragment = $Channel.Fragment.Substring($end)
+            }
+            # DISM puede actualizar la misma línea con CR o escribir % antes
+            # del terminador. Conservar fragmentos evita perder valores partidos.
+            if ($ProgressMode -eq 'Native') {
+                Receive-IsoInfoPercentText $Shared $ActivityId $Channel.Fragment $ProgressMode
+            }
+            if ($Channel.Fragment.Length -gt 16384) { $Channel.Fragment = $Channel.Fragment.Substring($Channel.Fragment.Length - 1024) }
+        }
+        $Channel.Pending = $Channel.Reader.ReadAsync($Channel.Buffer, 0, $Channel.Buffer.Length)
+    }
+}
+
 function Invoke-IsoInfoProcess {
     param([string]$Executable, [string[]]$Arguments, $Shared,
-        [ValidateRange(1,86400)][int]$TimeoutSeconds = 1800, [switch]$IgnoreCancellation)
+        [ValidateRange(1,86400)][int]$TimeoutSeconds = 1800, [switch]$IgnoreCancellation,
+        [string]$ActivityId = '', [ValidateSet('None','Native','Record')][string]$ProgressMode = 'None')
     # El runspace supervisa un proceso propio. Nunca detener procesos por nombre.
     if (-not $IgnoreCancellation -and $null -ne $Shared -and $Shared.CancelRequested) {
         throw [OperationCanceledException]::new('Operación cancelada antes de iniciar el proceso.')
@@ -169,9 +225,11 @@ function Invoke-IsoInfoProcess {
         $process.StartInfo.RedirectStandardError = $true
         $started = $process.Start()
         if (-not $started) { throw 'No se pudo iniciar el proceso de consulta.' }
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        while (-not $process.WaitForExit(150)) {
+        $stdout = New-IsoInfoProcessChannel $process.StandardOutput
+        $stderr = New-IsoInfoProcessChannel $process.StandardError
+        while (-not $process.WaitForExit(100)) {
+            Receive-IsoInfoProcessChannel $stdout $Shared $ActivityId $ProgressMode
+            Receive-IsoInfoProcessChannel $stderr $Shared
             if (-not $IgnoreCancellation -and $null -ne $Shared -and $Shared.CancelRequested) {
                 throw [OperationCanceledException]::new('Operación cancelada. Se interrumpió el proceso de consulta propio.')
             }
@@ -182,7 +240,10 @@ function Invoke-IsoInfoProcess {
         # Un descendiente puede mantener los pipes abiertos tras salir el proceso.
         # No usar WaitForExit() ni GetResult() sin verificar antes su terminación.
         $drainClock = [Diagnostics.Stopwatch]::StartNew()
-        while (-not ($stdout.IsCompleted -and $stderr.IsCompleted)) {
+        while (-not ($stdout.Completed -and $stderr.Completed)) {
+            Receive-IsoInfoProcessChannel $stdout $Shared $ActivityId $ProgressMode
+            Receive-IsoInfoProcessChannel $stderr $Shared
+            if ($stdout.Completed -and $stderr.Completed) { break }
             if ($drainClock.Elapsed.TotalSeconds -ge 2) {
                 if ($null -ne $Shared) { $Shared.ProcessInterrupted = $true }
                 throw 'El proceso terminó pero no cerró sus canales de salida.'
@@ -192,7 +253,7 @@ function Invoke-IsoInfoProcess {
             }
             Start-Sleep -Milliseconds 25
         }
-        $output = $stdout.GetAwaiter().GetResult() + "`r`n" + $stderr.GetAwaiter().GetResult()
+        $output = $stdout.Text.ToString() + "`r`n" + $stderr.Text.ToString()
         if ($process.ExitCode -ne 0) {
             $detail = $output.Trim()
             if ($detail.Length -gt 6000) { $detail = $detail.Substring($detail.Length - 6000) }
@@ -222,6 +283,126 @@ function Invoke-IsoInfoProcess {
     }
 }
 
+function Start-IsoInfoDismActivity {
+    param($Shared, [string]$Name)
+    if ($null -eq $Shared) { return '' }
+    $id = [guid]::NewGuid().ToString('N')
+    # Publicar una instantánea completa; el hilo de la interfaz solo la lee.
+    $Shared.DismActivity = [pscustomobject]@{ Id = $id; Name = $Name; State = 'Activa';
+        StartedUtc = [datetime]::UtcNow; EndedUtc = $null; Percent = $null }
+    return $id
+}
+
+function Set-IsoInfoDismPercent {
+    param($Shared, [string]$Id, [double]$Percent)
+    if ($null -eq $Shared -or -not $Id -or [double]::IsNaN($Percent) -or
+        [double]::IsInfinity($Percent) -or $Percent -lt 0 -or $Percent -gt 100) { return }
+    $activity = $Shared.DismActivity
+    if ($null -eq $activity -or $activity.Id -ne $Id -or $activity.State -ne 'Activa') { return }
+    if ($null -ne $activity.Percent -and $Percent -le [double]$activity.Percent) { return }
+    # El identificador evita aplicar actualizaciones de una operación anterior.
+    $Shared.DismActivity = [pscustomobject]@{ Id = $activity.Id; Name = $activity.Name; State = $activity.State;
+        StartedUtc = $activity.StartedUtc; EndedUtc = $null; Percent = $Percent }
+}
+
+function Stop-IsoInfoDismActivity {
+    param($Shared, [string]$Id, [string]$Outcome = 'Finalizada')
+    if ($null -eq $Shared -or -not $Id) { return }
+    $activity = $Shared.DismActivity
+    if ($null -eq $activity -or $activity.Id -ne $Id) { return }
+    if ($Shared.UnstoppedProcessId) { $Outcome = 'Sin confirmar' }
+    $Shared.DismActivity = [pscustomobject]@{ Id = $activity.Id; Name = $activity.Name; State = $Outcome;
+        StartedUtc = $activity.StartedUtc; EndedUtc = [datetime]::UtcNow;
+        Percent = $(if ($Outcome -eq 'Finalizada' -and $null -ne $activity.Percent) { 100.0 } else { $activity.Percent }) }
+}
+
+function Get-IsoInfoDismActivityName {
+    param([string]$Command, [hashtable]$Parameters)
+    switch ($Command) {
+        'Mount-WindowsImage' { return "Montando índice $($Parameters.Index)" }
+        'Dismount-WindowsImage' { return 'Desmontando imagen' }
+        'Get-WindowsImage' {
+            if ($Parameters.Mounted) { return 'Comprobando montajes' }
+            if ($Parameters.Index) { return "Leyendo índice $($Parameters.Index)" }
+            return 'Detectando índices'
+        }
+        'Get-WindowsPackage' { return 'Consultando paquetes y actualizaciones' }
+        'Get-WindowsDriver' { return 'Consultando controladores' }
+        'Get-WindowsOptionalFeature' { return 'Consultando características' }
+        'Export-WindowsImage' { return "Verificando índice $($Parameters.SourceIndex)" }
+        default { return 'Consultando imagen' }
+    }
+}
+
+function Get-IsoInfoDismActivityOutcome {
+    param($Record)
+    if ($Record.Exception -is [OperationCanceledException]) { return 'Cancelada' }
+    if ($Record.Exception -is [TimeoutException]) { return 'Tiempo agotado' }
+    return 'Error'
+}
+
+function Get-IsoInfoDismActivityOffset {
+    param([double]$ElapsedMilliseconds, [int]$TrackWidth, [int]$SegmentWidth)
+    $travel = [math]::Max(0, $TrackWidth - $SegmentWidth)
+    if ($travel -le 0) { return 0 }
+    # Recorrido de ida y vuelta de 2,4 s. El segmento permanece dentro de la barra.
+    $phase = ([math]::Max(0, $ElapsedMilliseconds) % 2400.0) / 1200.0
+    if ($phase -gt 1) { $phase = 2 - $phase }
+    return [int][math]::Round($travel * $phase)
+}
+
+function Get-IsoInfoDismActivityView {
+    param($Activity, [datetime]$NowUtc = [datetime]::UtcNow)
+    if ($null -eq $Activity) {
+        return [pscustomobject]@{ Active = $false; Determinate = $false; Value = 0; Tone = 'Normal'; Text = 'DISM: sin consulta activa' }
+    }
+    $active = $Activity.State -eq 'Activa'
+    $end = if ($active -or $null -eq $Activity.EndedUtc) { $NowUtc } else { [datetime]$Activity.EndedUtc }
+    $elapsed = $end - [datetime]$Activity.StartedUtc
+    if ($elapsed.Ticks -lt 0) { $elapsed = [timespan]::Zero }
+    $hasPercent = $null -ne $Activity.Percent
+    $value = 0
+    if ($hasPercent) {
+        # 100% informado aún puede terminar con error; solo confirmar al salir
+        # correctamente y recuperar/validar el resultado de la consulta.
+        $limit = if ($Activity.State -eq 'Finalizada') { 100.0 } else { 99.9 }
+        $value = [int][math]::Floor([math]::Max(0.0, [math]::Min($limit, [double]$Activity.Percent)) * 10)
+    }
+    $percentText = ([double]($value / 10.0)).ToString('0.#', [Globalization.CultureInfo]::CurrentCulture) + ' %'
+    $description = switch ($Activity.State) {
+        'Activa' {
+            if (-not $hasPercent) { 'En curso; sin porcentaje disponible' }
+            elseif ([double]$Activity.Percent -ge 100) { 'Finalizando y comprobando resultado...' }
+            else { $percentText }
+        }
+        'Finalizada' { if ($hasPercent) { '100 %; consulta terminada' } else { 'Consulta terminada' } }
+        'Cancelada' { 'Consulta cancelada' }
+        'Tiempo agotado' { 'Tiempo agotado' }
+        'Sin confirmar' { 'Estado sin confirmar' }
+        default { 'Consulta con error' }
+    }
+    if (-not $active -and $Activity.State -ne 'Finalizada' -and $hasPercent) {
+        $description += "; $percentText, no completada"
+    }
+    $tone = if ($active) { 'Active' } elseif ($Activity.State -in @('Error','Tiempo agotado','Sin confirmar','Cancelada')) { 'Warning' } else { 'Normal' }
+    return [pscustomobject]@{ Active = $active; Determinate = $hasPercent; Value = $value; Tone = $tone;
+        Text = "DISM: $($Activity.Name) | $description | $($elapsed.ToString('hh\:mm\:ss'))" }
+}
+
+function Invoke-IsoInfoDirectDismRead {
+    param([hashtable]$Parameters, $Shared)
+    # La lectura básica conserva su consulta en el runspace y su cancelación cooperativa.
+    $id = Start-IsoInfoDismActivity $Shared (Get-IsoInfoDismActivityName 'Get-WindowsImage' $Parameters)
+    $outcome = 'Error'
+    try {
+        $result = @(Get-WindowsImage @Parameters -LogPath $Shared.LogPath -ErrorAction Stop)
+        $outcome = 'Finalizada'
+        foreach ($item in $result) { $item }
+    } catch { $outcome = Get-IsoInfoDismActivityOutcome $_; throw }
+    finally { Stop-IsoInfoDismActivity $Shared $id $outcome }
+}
+
+
 function Invoke-IsoInfoNative {
     param([ValidateSet('dism.exe','reg.exe')][string]$Name, [string[]]$Arguments,
         $Shared, [int]$TimeoutSeconds = 120, [switch]$IgnoreCancellation)
@@ -230,12 +411,22 @@ function Invoke-IsoInfoNative {
         $Arguments = @($Arguments | Where-Object { $_ -notmatch '(?i)^/LogPath:' }) + @("/LogPath:$($logs.LogPath)")
     }
     Write-IsoInfoDiagnostic $Shared "Iniciando $Name. Límite: $TimeoutSeconds s."
+    $activityId = ''; $activityOutcome = 'Error'
     try {
-        $result = Invoke-IsoInfoProcess -Executable (Get-IsoInfoSystemExecutable $Name) -Arguments $Arguments `
-            -Shared $Shared -TimeoutSeconds $TimeoutSeconds -IgnoreCancellation:$IgnoreCancellation
+        $exe = Get-IsoInfoSystemExecutable $Name
+        if ($Name -eq 'dism.exe') {
+            $activityName = if ($Arguments -contains '/Get-Intl') { 'Consultando idiomas y región' } else { 'Leyendo metadatos de imagen' }
+            $activityId = Start-IsoInfoDismActivity $Shared $activityName
+        }
+        $mode = if ($Name -eq 'dism.exe') { 'Native' } else { 'None' }
+        $result = Invoke-IsoInfoProcess -Executable $exe -Arguments $Arguments `
+            -Shared $Shared -TimeoutSeconds $TimeoutSeconds -IgnoreCancellation:$IgnoreCancellation `
+            -ActivityId $activityId -ProgressMode $mode
         Write-IsoInfoDiagnostic $Shared "$Name finalizó correctamente."
+        $activityOutcome = 'Finalizada'
         return $result
-    } catch { Write-IsoInfoDiagnostic $Shared "$Name : $($_.Exception.Message)"; throw }
+    } catch { $activityOutcome = Get-IsoInfoDismActivityOutcome $_; Write-IsoInfoDiagnostic $Shared "$Name : $($_.Exception.Message)"; throw }
+    finally { Stop-IsoInfoDismActivity $Shared $activityId $activityOutcome }
 }
 
 function Invoke-IsoInfoDismTask {
@@ -255,35 +446,70 @@ function Invoke-IsoInfoDismTask {
     # Los datos se deserializan: rutas/nombres nunca se interpolan como código.
     $child = @'
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
+$pipeline = $null
+$exitCode = 1
 try {
     $data = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')))
-    Import-Module Dism -ErrorAction Stop
-    $allowed = @('Mount-WindowsImage','Dismount-WindowsImage','Get-WindowsImage','Get-WindowsPackage','Get-WindowsDriver','Get-WindowsOptionalFeature','Export-WindowsImage')
-    if ($data.Command -notin $allowed) { throw 'Consulta no admitida.' }
-    $command = Get-Command -Name $data.Command -Module Dism -CommandType Cmdlet,Function -ErrorAction Stop
-    $parameters = $data.Parameters
-    $result = @(& $command @parameters -ErrorAction Stop)
+    # El cmdlet sigue aislado en este proceso hijo. Su runspace publica
+    # ProgressRecord; este hilo transmite solo porcentajes por un canal explícito.
+    $pipeline = [powershell]::Create()
+    $operation = {
+        param($CommandName, $Parameters)
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'Continue'
+        Import-Module Dism -ErrorAction Stop
+        $allowed = @('Mount-WindowsImage','Dismount-WindowsImage','Get-WindowsImage','Get-WindowsPackage','Get-WindowsDriver','Get-WindowsOptionalFeature','Export-WindowsImage')
+        if ($CommandName -notin $allowed) { throw 'Consulta no admitida.' }
+        $command = Get-Command -Name $CommandName -Module Dism -CommandType Cmdlet,Function -ErrorAction Stop
+        & $command @Parameters -ErrorAction Stop
+    }
+    [void]$pipeline.AddScript($operation.ToString()).AddArgument($data.Command).AddArgument($data.Parameters)
+    $handle = $pipeline.BeginInvoke()
+    $lastPercent = -1
+    do {
+        $completed = $handle.IsCompleted
+        foreach ($record in $pipeline.Streams.Progress.ReadAll()) {
+            # No convertir Write-Progress -Completed (habitualmente -1) en éxito.
+            # Los registros subordinados no representan el total del cmdlet.
+            if ($record.RecordType -eq [Management.Automation.ProgressRecordType]::Completed -or $record.ParentActivityId -ge 0) { continue }
+            $value = $record.PercentComplete
+            if ($value -ge 0 -and $value -le 100 -and $value -gt $lastPercent) {
+                [Console]::Out.WriteLine('ISOINFO_PROGRESS:' + $value.ToString([Globalization.CultureInfo]::InvariantCulture))
+                [Console]::Out.Flush()
+                $lastPercent = $value
+            }
+        }
+        if (-not $completed) { Start-Sleep -Milliseconds 75 }
+    } while (-not $completed)
+    $result = @($pipeline.EndInvoke($handle))
+    if ($pipeline.HadErrors) { throw ($pipeline.Streams.Error | Out-String) }
     $xml = [Management.Automation.PSSerializer]::Serialize($result, 8)
     [IO.File]::WriteAllText($data.ResultPath, $xml, [Text.Encoding]::UTF8)
-    exit 0
+    $exitCode = 0
 } catch {
     [Console]::Error.WriteLine($_.Exception.Message)
-    exit 1
+} finally {
+    if ($null -ne $pipeline) { $pipeline.Dispose() }
 }
+exit $exitCode
 '@
     $child = $child.Replace('__PAYLOAD__', $encodedData)
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+    $activityId = ''; $activityOutcome = 'Error'
     try {
         $exe = Get-IsoInfoSystemExecutable 'WindowsPowerShell\v1.0\powershell.exe'
+        $activityId = Start-IsoInfoDismActivity $Shared (Get-IsoInfoDismActivityName $Command $Parameters)
         $null = Invoke-IsoInfoProcess -Executable $exe -Arguments @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encodedCommand) `
-            -Shared $Shared -TimeoutSeconds $TimeoutSeconds -IgnoreCancellation:$IgnoreCancellation
+            -Shared $Shared -TimeoutSeconds $TimeoutSeconds -IgnoreCancellation:$IgnoreCancellation `
+            -ActivityId $activityId -ProgressMode 'Record'
         if (-not [IO.File]::Exists($resultPath)) { throw 'DISM terminó sin devolver un resultado de la consulta.' }
         $result = [Management.Automation.PSSerializer]::Deserialize([IO.File]::ReadAllText($resultPath))
         Write-IsoInfoDiagnostic $Shared "$Command finalizó correctamente."
+        $activityOutcome = 'Finalizada'
         foreach ($item in $result) { $item }
-    } catch { Write-IsoInfoDiagnostic $Shared "$Command : $($_.Exception.Message)"; throw }
+    } catch { $activityOutcome = Get-IsoInfoDismActivityOutcome $_; Write-IsoInfoDiagnostic $Shared "$Command : $($_.Exception.Message)"; throw }
     finally {
+        Stop-IsoInfoDismActivity $Shared $activityId $activityOutcome
         # Solo el archivo que escribió este proceso. Nunca tocar directorios montados.
         if ([IO.File]::Exists($resultPath)) { try { [IO.File]::Delete($resultPath) } catch {} }
         try { [IO.Directory]::Delete($folder, $false) } catch {}
@@ -738,7 +964,7 @@ function Invoke-IsoInfoRead {
             throw 'El archivo cambió desde la lectura anterior. Pulsa Leer para iniciar una lectura nueva.'
         }
         Send-IsoInfoEvent $Shared 'File' $stamp
-        $summaries = @(Get-WindowsImage -ImagePath $stamp.Path -LogPath $Shared.LogPath -ErrorAction Stop)
+        $summaries = @(Invoke-IsoInfoDirectDismRead @{ ImagePath = $stamp.Path } $Shared)
         $seen = @{}
         foreach ($summary in $summaries) {
             $idx = [int](Get-IsoInfoProperty $summary @('ImageIndex','Index') 0)
@@ -760,7 +986,7 @@ function Invoke-IsoInfoRead {
             $idx = [int](Get-IsoInfoProperty $summary @('ImageIndex','Index'))
             Send-IsoInfoEvent $Shared 'Current' "Leyendo índice $idx..."
             try {
-                $details = @(Get-WindowsImage -ImagePath $stamp.Path -Index $idx -LogPath $Shared.LogPath -ErrorAction Stop)
+                $details = @(Invoke-IsoInfoDirectDismRead @{ ImagePath = $stamp.Path; Index = $idx } $Shared)
                 if ($details.Count -ne 1) { throw 'DISM no devolvió una ficha única para este índice.' }
                 $row = New-IsoInfoRow -Summary $summary -Image $details[0] -Status 'Correcto'
                 if (-not $row.DefaultLanguage -and -not $Shared.CancelRequested) {
@@ -904,7 +1130,7 @@ function Write-IsoInfoReport {
                 foreach ($name in $names) { [void]$builder.Append('<td>' + [Net.WebUtility]::HtmlEncode([string]$row.$name) + '</td>') }
                 [void]$builder.Append('</tr>')
             }
-            [void]$builder.Append('</tbody></table></div><footer>IsoCore 1.3.6 · ' + [Net.WebUtility]::HtmlEncode([string]$Report.ExportedUtc) + '</footer></html>')
+            [void]$builder.Append('</tbody></table></div><footer>IsoCore 1.3.8 · ' + [Net.WebUtility]::HtmlEncode([string]$Report.ExportedUtc) + '</footer></html>')
             $content = $builder.ToString()
         }
         default { throw 'Usa una extensión .csv, .html o .json.' }
@@ -995,7 +1221,7 @@ function Select-IsoInfoRows {
 function New-IsoInfoReport {
     param([string]$Title, [string]$Summary, [object[]]$Rows, $Sources = @(), [string]$AnalysisUtc = '')
     $times = @($Rows | ForEach-Object { Get-IsoInfoProperty $_ @('LeidoUTC'); Get-IsoInfoProperty $_ @('AdvancedReadUtc'); Get-IsoInfoProperty $_ @('VerifiedUtc') } | Where-Object { $_ } | Sort-Object)
-    [pscustomobject][ordered]@{ SchemaVersion = 2; ApplicationVersion = '1.3.6'; Title = $Title; Summary = $Summary;
+    [pscustomobject][ordered]@{ SchemaVersion = 2; ApplicationVersion = '1.3.8'; Title = $Title; Summary = $Summary;
         AnalysisUtc = $(if ($AnalysisUtc) { $AnalysisUtc } elseif ($times.Count) { $times[-1] } else { '' }); ComputerName = [Environment]::MachineName;
         ExportedUtc = [datetime]::UtcNow.ToString('o'); Sources = @($Sources); Rows = @($Rows) }
 }
@@ -1136,7 +1362,7 @@ function New-IsoCoreImageInfoTab {
     # CommandInfo mantiene el ámbito del módulo al ejecutarse eventos GetNewClosure.
     $api = @{}
     foreach ($command in @('New-IsoInfoDataset','Select-IsoInfoRows','Get-IsoInfoPercent','Format-IsoInfoBytes','Compare-IsoInfoImages',
-        'Get-IsoInfoTableRows','Write-IsoInfoReport','New-IsoInfoReport','Show-IsoInfoReport','Get-IsoInfoSourceDrives')) {
+        'Get-IsoInfoTableRows','Write-IsoInfoReport','New-IsoInfoReport','Show-IsoInfoReport','Get-IsoInfoSourceDrives','Get-IsoInfoDismActivityView','Get-IsoInfoDismActivityOffset')) {
         $api[$command] = Get-Command $command -CommandType Function
     }
     $tab = $null; $tip = $null; $timer = $null
@@ -1262,8 +1488,9 @@ function New-IsoCoreImageInfoTab {
         }
         [void]$root.Controls.Add($list,0,7)
         $footer = New-Object System.Windows.Forms.TableLayoutPanel
-        $footer.Dock = 'Fill'; $footer.AutoSize = $true; $footer.ColumnCount = 1; $footer.RowCount = 2
+        $footer.Dock = 'Fill'; $footer.AutoSize = $true; $footer.ColumnCount = 1; $footer.RowCount = 3
         [void]$footer.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent',100)))
+        [void]$footer.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
         [void]$footer.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
         [void]$footer.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
         $status = & $newLabel 'Listo. Selecciona una unidad, carpeta o archivo WIM/ESD.'
@@ -1272,7 +1499,7 @@ function New-IsoCoreImageInfoTab {
         $progress = New-Object System.Windows.Forms.ProgressBar
         $progress.Name = 'ImageInfoProgress'; $progress.Width = 190; $progress.Height = 24; $progress.Style = 'Continuous'
         $progress.Minimum = 0; $progress.Maximum = 100; $progress.Value = 0
-        $percent = & $newLabel '0 %'
+        $percent = & $newLabel '0 % general'
         $percent.Name = 'ImageInfoPercent'
         $cancel = & $newButton 'ImageInfoCancel' 'Cancelar'
         $retry = & $newButton 'ImageInfoRetry' 'Reintentar pendientes'
@@ -1280,9 +1507,24 @@ function New-IsoCoreImageInfoTab {
         $clear = & $newButton 'ImageInfoClear' 'Limpiar'
         $diagnostic = & $newButton 'ImageInfoDiagnostic' 'Ver diagnóstico'
         foreach ($control in @($progress,$percent,$cancel,$retry,$export,$clear,$diagnostic)) { [void]$footerButtons.Controls.Add($control) }
+        $activityBar = & $newFlow
+        $dismProgress = New-Object System.Windows.Forms.Panel
+        $dismProgress.Name = 'ImageInfoDismActivity'; $dismProgress.Width = 190; $dismProgress.Height = 24
+        $dismProgress.BorderStyle = 'FixedSingle'; $dismProgress.BackColor = $Palette.Panel
+        $dismPulse = New-Object System.Windows.Forms.Panel
+        $dismPulse.Name = 'ImageInfoDismPulse'; $dismPulse.BackColor = $Palette.Cyan
+        $dismPulse.Width = 36; $dismPulse.Height = 18; $dismPulse.Visible = $false
+        [void]$dismProgress.Controls.Add($dismPulse)
+        $dismStatus = & $newLabel 'DISM: sin consulta activa'
+        $dismStatus.Name = 'ImageInfoDismStatus'
+        [void]$activityBar.Controls.Add($dismProgress); [void]$activityBar.Controls.Add($dismStatus)
         [void]$footer.Controls.Add($status,0,0); [void]$footer.Controls.Add($footerButtons,0,1)
+        [void]$footer.Controls.Add($activityBar,0,2)
         [void]$root.Controls.Add($footer,0,8); [void]$tab.Controls.Add($root)
-        $tip.SetToolTip($progress,'La animación indica una consulta en curso. El porcentaje cuenta índices o etapas terminadas, incluido montaje y desmontaje; no estima tiempo restante.')
+        $tip.SetToolTip($progress,'Avance general: porcentaje de índices o etapas procesadas. Los errores se indican por separado; no estima tiempo restante.')
+        $dismTip = 'Avance de la operación DISM actual. Si DISM informa un porcentaje, la barra lo muestra; solo confirma 100 % al terminar correctamente. Sin porcentaje, el segmento móvil indica espera, no avance medido.'
+        $tip.SetToolTip($dismProgress,$dismTip)
+        $tip.SetToolTip($dismPulse,$dismTip)
         $tip.SetToolTip($drive,'USB, lectores CD/DVD físicos y unidades ópticas virtuales/ISO. Los lectores sin medio se indican en la lista. No incluye VHD/VHDX.')
         $tip.SetToolTip($refresh,'Actualiza el listado después de conectar un USB, insertar/retirar un CD/DVD o montar/desmontar una ISO.')
         $tip.SetToolTip($retry,'Reintenta los índices fallidos o pendientes de la imagen A; conserva los índices correctos.')
@@ -1367,19 +1609,49 @@ function New-IsoCoreImageInfoTab {
             $state.A = $null; $state.B = $null; $state.Inventory = $null; $state.InventoryResult = $null; $state.Verification = $null; $state.VerificationResult = $null
             $state.Muting = $true
             try { $candidates.Items.Clear(); $candidates.SelectedIndex = -1; $search.Clear() } finally { $state.Muting = $false }
-            $state.Candidates = @(); $progress.Value = 0; $percent.Text = '0 %'
+            $state.Candidates = @(); $progress.Value = 0; $percent.Text = '0 % general'
+            $state.Shared = $null; & $actions.Activity
             & $actions.Filters; & $actions.Render
         }.GetNewClosure()
+        $actions.Activity = {
+            if ($state.Closing -or $tab.IsDisposed) { return }
+            $snapshot = if ($null -ne $state.Shared) { $state.Shared.DismActivity } else { $null }
+            $now = [datetime]::UtcNow
+            $view = & $api['Get-IsoInfoDismActivityView'] $snapshot $now
+            # Un panel coloreado funciona también en el tema clásico y en hosts
+            # que ya crearon su ventana. Todo el movimiento ocurre en el hilo UI.
+            $trackWidth = [math]::Max(0, $dismProgress.ClientSize.Width - 4)
+            $dismPulse.Height = [math]::Max(0, $dismProgress.ClientSize.Height - 4)
+            $dismPulse.Top = 2
+            if ($view.Determinate) {
+                $dismPulse.Left = 2
+                # Floor evita dibujar la barra completa antes de confirmar éxito.
+                $dismPulse.Width = [int][math]::Floor($trackWidth * $view.Value / 1000.0)
+            } elseif ($view.Active) {
+                $dismPulse.Width = [math]::Min($trackWidth, [math]::Max(8, [int][math]::Round($trackWidth / 5.0)))
+                $elapsedMs = ($now - [datetime]$snapshot.StartedUtc).TotalMilliseconds
+                $offset = & $api['Get-IsoInfoDismActivityOffset'] $elapsedMs $trackWidth $dismPulse.Width
+                $dismPulse.Left = 2 + $offset
+            }
+            $dismPulse.BackColor = if ($view.Tone -eq 'Warning') { [Drawing.Color]::Orange } else { $Palette.Cyan }
+            $dismPulse.Visible = $view.Active -or ($view.Determinate -and $view.Value -gt 0)
+            if ($dismStatus.Text -ne $view.Text) {
+                $dismStatus.Text = $view.Text
+                $tip.SetToolTip($dismStatus,$view.Text)
+            }
+            $dismStatus.ForeColor = switch ($view.Tone) { 'Active' { $Palette.Cyan } 'Warning' { [Drawing.Color]::Orange } default { $Palette.Secondary } }
+        }.GetNewClosure()
+
         $actions.Progress = {
             param($Data)
             $state.Done = [int]$Data.Done; $state.Total = [int]$Data.Total; $state.Failures = [int]$Data.Failures
             $value = & $api['Get-IsoInfoPercent'] $state.Done $state.Total
             $progress.Value = [math]::Min(100,[math]::Max(0,$value))
-            $progress.Style = if ($state.Busy) { 'Marquee' } else { 'Continuous' }
-            $percent.Text = if ($state.Total -gt 0) { "$($progress.Value) %" } else { 'En curso' }
+            $progress.Style = 'Continuous'
+            $percent.Text = if ($state.Total -gt 0) { "$($progress.Value) % general" } else { 'En curso' }
             $unit = if ($state.Request.Operation -in @('Inventory','Advanced','Verify')) { 'etapas' } else { 'índices' }
             $prefix = if ($state.Request.Target -eq 'B') { 'Imagen B — ' } else { '' }
-            $count = if ($state.Total -gt 0) { "$($state.Done)/$($state.Total) $unit; $($state.Failures) con error. " } else { '' }
+            $count = if ($state.Total -gt 0) { "Procesadas: $($state.Done)/$($state.Total) $unit; $($state.Failures) con error. " } else { '' }
             $phase = $state.Current
             if ($state.Shared.CancelRequested) {
                 $phase = if ($state.Shared.InCleanup) { 'Cancelación solicitada. ' + $state.Current }
@@ -1399,9 +1671,10 @@ function New-IsoCoreImageInfoTab {
             $state.Done = 0; $state.Total = if ($Request.Operation -in @('Advanced','Inventory')) { 5 } else { 0 }; $state.Failures = 0
             $state.Clock = [Diagnostics.Stopwatch]::StartNew(); $state.StageClock = [Diagnostics.Stopwatch]::StartNew(); $state.LastHeartbeat = 0
             $state.DiagnosticPath = ''
-            $progress.Value = 0; $progress.Style = 'Marquee'; $percent.Text = 'En curso'
-            $state.Shared = [hashtable]::Synchronized(@{ CancelRequested = $false; InCleanup = $false; ProcessInterrupted = $false; LogDirectory = $LogDirectory; Events = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]') })
+            $progress.Value = 0; $progress.Style = 'Continuous'; $percent.Text = 'Preparando...'
+            $state.Shared = [hashtable]::Synchronized(@{ CancelRequested = $false; InCleanup = $false; ProcessInterrupted = $false; DismActivity = $null; LogDirectory = $LogDirectory; Events = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]') })
             $state.Busy = $true
+            & $actions.Activity
             & $actions.Controls
             & $actions.Status $(if ($Request.Operation -eq 'Discover') { 'Buscando imágenes WIM/ESD...' } elseif ($Request.Operation -eq 'Inventory') { 'Preparando inventario...' } elseif ($Request.Operation -eq 'Advanced') { 'Preparando análisis avanzado...' } elseif ($Request.Operation -eq 'Verify') { 'Preparando verificación DISM...' } else { 'Detectando índices...' })
             try {
@@ -1564,6 +1837,7 @@ function New-IsoCoreImageInfoTab {
                     return
                 }
                 & $actions.Drain
+                & $actions.Activity
                 if (-not $state.Handle.IsCompleted) {
                     if ($null -ne $state.Clock -and ($state.Clock.Elapsed.TotalSeconds - $state.LastHeartbeat) -ge 1) {
                         $state.LastHeartbeat = $state.Clock.Elapsed.TotalSeconds
@@ -1642,7 +1916,7 @@ function New-IsoCoreImageInfoTab {
             if ($null -ne $state.PowerShell) { try { $state.PowerShell.Dispose() } catch {} }
             if ($null -ne $state.Runspace) { try { $state.Runspace.Close(); $state.Runspace.Dispose() } catch {} }
             $state.PowerShell = $null; $state.Runspace = $null; $state.Handle = $null; $state.Busy = $false
-            if (-not $state.Closing) { & $actions.Controls }
+            if (-not $state.Closing) { & $actions.Activity; & $actions.Controls }
         }.GetNewClosure()
 
         $actions.Cancel = {
