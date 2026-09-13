@@ -1,4 +1,4 @@
-﻿# IsoCore.ImageInfo v1.3.8 - Windows PowerShell 5.1; UTF-8 con BOM.
+﻿# IsoCore.ImageInfo - Windows PowerShell 5.1; UTF-8 con BOM.
 $script:IsoInfoModulePath = $PSCommandPath
 
 function Get-IsoInfoProperty {
